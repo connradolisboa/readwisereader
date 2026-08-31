@@ -37,8 +37,9 @@ leave it stable in Phase 1.
 
 The chief architectural debt is the concentration of transport, Reader mapping,
 settings, filesystem work, HTML/images, metadata, collections, highlights,
-archive cleanup, and menu UI in one file. More importantly, metadata listing and
-full HTML download are coupled, blocking a light picker.
+archive cleanup, and menu UI in one file. Automatic sync still couples its list
+requests to full HTML, but the browser and picker use a separate metadata-first
+path.
 
 ## KOReader integration findings
 
@@ -77,7 +78,7 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Highlights Readwise to Kindle | Requires experimentation/private API | No reliable source-location mapping into generated HTML. |
 | Daily Digest | Requires experimentation/private API | No documented Reader API endpoint audited. |
 | Feed | Official API, not implemented | `feed` is a documented list location. |
-| Search | Requires experimentation/private API | No public search HTTP endpoint in the Reader API reference. |
+| Search | Metadata-only implemented | The public LIST REST API has no search parameter. The plugin filters title, author, site, summary, and tags locally, one 25-document page at a time. Readwise's separate CLI/MCP full-text search is not called from Kindle. |
 
 The public API documents token authentication, paginated list requests,
 optional HTML, `image_url`, metadata, `reading_progress`, update fields, tags,
@@ -101,7 +102,7 @@ readwisereader.koplugin/
   sync/documents.lua           # automatic sync orchestration
   sync/highlights.lua          # clipping/export orchestration
   sync/archive.lua             # completion and cleanup
-  ui/picker.lua                # browser and selected download flow
+  ui/browser.lua               # browser, search, selection, selected downloads
   ui/settings.lua              # later settings extraction
   util/http.lua                # shared timeout/retry/binary GET policy
 ```
@@ -111,8 +112,8 @@ Phase 1A created `library/covers.lua`. It streams HTTPS covers to
 or PNG signatures, and applies the cached file through `DocSettings`. The
 persisted `document_cover_urls` map avoids re-downloading a known usable cover
 when an article is re-downloaded; `download_covers` defaults to true.
-`api/reader.lua` and `ui/browser.lua` now provide the metadata-only browser;
-the selection/download picker remains future work. Retain the filename
+`api/reader.lua` and `ui/browser.lua` now provide the metadata-only browser,
+metadata search, reusable selection, and selected-download flow. Retain the filename
 format, `processHtmlContent`, clipping/export, collection calls, archive cleanup,
 and existing settings behavior until covered by tests and device verification.
 
@@ -157,7 +158,7 @@ existing `util.makePath` convention at validation time; no files are moved.
   create response only groups modified IDs by source and cannot safely map them
   back to individual clippings. No edit or deletion sync is added.
 
-## Phase 1B Part 1: metadata-only Reader browser
+## Phase 1B: metadata browser, search, and selected downloads
 
 `main.lua` owns the menu integration and established authenticated transport.
 `api/reader.lua` owns the `/list/` request shape and normalizes each valid API
@@ -178,12 +179,37 @@ centralized article/book directories and matching the established filename ID;
 there is no per-row filesystem scan and no metadata database. Browser errors
 are non-fatal: missing tokens, network failures, malformed rows, empty locations,
 and HTTP failures show a message and leave normal local reading and sync paths
-unchanged. The browser does not render thumbnails, fetch HTML, create files,
-change Reader state, or synchronize progress.
+unchanged. Metadata browsing/search does not render thumbnails, fetch HTML,
+create files, change Reader state, or synchronize progress.
 
-Phase 1B Part 2 may add selection state and a Download Selected action that
-feeds the existing downloader. It must keep browser downloading separate from
-automatic-sync reconciliation, archive, and timestamp mutation.
+Search Library uses KOReader's native `InputDialog`. The public v3 LIST REST API
+has no documented query parameter, so this is deliberately metadata-only search,
+not Reader full-text search. Each Search/Search next page action requests at most
+one 25-item metadata page with HTML disabled, retains only matches, and checks
+Lua-lowercased plain substrings in title, author, site, summary, and tag names.
+Results are limited to Inbox, Later, Shortlist, and Archive; Feed documents and
+child highlight/note rows are ignored. Search location is shown in result rows.
+Lua 5.1 has no Unicode case-folding here, so non-ASCII searches are reliably
+exact-case only.
+
+The same document-list builder now supplies selection to Inbox, Later,
+Shortlist, and search results. A tap toggles `[ ]`/`[x]`; a long press opens
+details so normal taps are unambiguous. Select all, Clear selection, and Download
+selected controls are standard touch-menu entries. Details for a document not
+yet local offer Download. Direct Open and Delete local copy remain omitted until
+the installed KOReader build provides a verified safe file-opening and complete
+sidecar/collection removal pattern.
+
+Selected download first builds one local-ID lookup. Already-local documents are
+reported without fetching content. Each remaining ID is retrieved sequentially
+through documented `GET /list/?id=...&withHtmlContent=true`, then passed to the
+existing `downloadDocument` writer. That preserves centralized Books/Articles
+routing, filenames, inline-image handling, covers, metadata sidecars,
+collections, and highlight identity. One failed detail request or writer call is
+counted and does not abort later items. Successful/already-local IDs update the
+session lookup immediately; no per-item directory rescan is performed. Picker
+downloads never run automatic reconciliation, archive actions, highlight export,
+filter mutation, or `last_sync_time` updates.
 
 ## Related
 

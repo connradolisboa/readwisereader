@@ -3,13 +3,21 @@
 This is an incremental product plan. Existing automatic sync, completion archive,
 and Kindle-to-Readwise highlight export remain in place throughout.
 
-## Phase 1: native covers and selected downloads
+## Phase 1: native covers, library search, and selected downloads
 
 - **Part 1 implemented, not Kindle-verified:** a metadata-only Reader browser
   for Inbox (`new`), Later, and Shortlist. It uses 25-item cursor pages, shows
   text-first metadata and local downloaded state, and never fetches HTML.
-- Part 2: add a Kindle-friendly KOReader selection flow and Download Selected.
-- Fetch full HTML only for selected documents.
+- **Part 2 implemented, not Kindle-verified:** reusable selection for those
+  browser lists and metadata-only search across Library locations. Tap toggles a
+  row, hold opens details, and Download Selected runs sequentially.
+- Search scans one 25-document public LIST page at a time and filters title,
+  author, site, summary, and tags locally. It is not full-text search; Load more
+  explicitly scans the next page. Feed and child highlight/note documents are
+  excluded from search results. Non-ASCII matching is exact-case because Lua 5.1
+  has no Unicode case-folding in this path.
+- Full HTML is fetched by the documented LIST `id` parameter only for selected
+  documents, then passed to the existing downloader.
 - Fetch `image_url` best-effort and install it with `DocSettings:flushCustomCover`
   so bundled CoverBrowser modes can use it.
 - Preserve existing automatic sync and settings/filename conventions. Browser
@@ -48,7 +56,8 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 ## Experimental future features
 
 - Multi-article Daily Digest EPUB.
-- Search via a future official API or an explicitly approved experiment.
+- True full-text search via a future documented REST endpoint or an explicitly
+  approved integration with Readwise's separate CLI/MCP products.
 - Reader-to-Kindle highlight import.
 - Generated fallback covers for documents without `image_url`.
 - Clearly-labelled approximate progress mapping, only if testing justifies it.

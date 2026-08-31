@@ -181,6 +181,9 @@ function ReadwiseReader:init()
         downloaded_ids = function()
             return self:getDownloadedDocumentIds()
         end,
+        download_documents = function(documents)
+            return self:downloadReaderDocuments(documents)
+        end,
         show_progress = function(text) self:showProgress(text) end,
         hide_progress = function() self:hideProgress() end,
     }
@@ -791,6 +794,13 @@ function ReadwiseReader:addToMainMenu(menu_items)
     menu_items.readwisereader = {
         text = "Readwise Reader",
         sub_item_table = {
+            {
+                text = "Search Library",
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self.browser:showSearchDialog(touchmenu_instance)
+                end,
+            },
             {
                 text = "Browse Reader",
                 sub_item_table_func = function()
@@ -1958,13 +1968,14 @@ function ReadwiseReader:getDownloadedDocumentIds()
     return ids
 end
 
-function ReadwiseReader:downloadDocument(document)
-    if self:shouldSkipDocument(document) then
+function ReadwiseReader:downloadDocument(document, options)
+    options = options or {}
+    if not options.ignore_filters and self:shouldSkipDocument(document) then
         logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- has excluded tags or location")
         return "skipped"
     end
     
-    if self:documentExists(document.id) then
+    if not options.already_checked and self:documentExists(document.id) then
         logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- already exists")
         return "skipped"
     end
@@ -2057,6 +2068,112 @@ function ReadwiseReader:downloadDocument(document)
         os.remove(filepath)
         return "failed"
     end
+end
+
+-- Preserve the metadata maps consumed by the established sidecar, collection,
+-- and highlight-export paths. Picker downloads are explicit user actions, so
+-- they do not modify the global sync filter lists or last-sync timestamp.
+function ReadwiseReader:rememberReaderDocumentClassification(document)
+    if type(document) ~= "table" or type(document.id) ~= "string" then
+        return
+    end
+    self.document_locations[document.id] = document.location
+    local tags = {}
+    if type(document.category) == "string" and document.category ~= "" then
+        table.insert(tags, document.category)
+        self.document_categories[document.category] = true
+    end
+    for _, tag in ipairs(document.tags or {}) do
+        if type(tag) == "string" and tag ~= "" then
+            table.insert(tags, tag)
+        end
+    end
+    self.document_tags[document.id] = tags
+end
+
+-- Sequential selected-document adapter around the proven writer. It resolves
+-- full HTML through the documented LIST id parameter only after selection,
+-- then delegates routing, filename creation, HTML/images, cover, metadata, and
+-- collection work to downloadDocument.
+function ReadwiseReader:downloadReaderDocuments(documents)
+    local result = {
+        downloaded = 0,
+        already_downloaded = 0,
+        skipped = 0,
+        failed = 0,
+        completed_ids = {},
+        downloaded_ids = {},
+    }
+    if type(documents) ~= "table" or #documents == 0 then
+        return result
+    end
+    if not self:validateSettings() then
+        result.cancelled = true
+        return result
+    end
+
+    local local_ids = self:getDownloadedDocumentIds()
+    self:initCollectionTracking()
+
+    for index, metadata in ipairs(documents) do
+        local id = type(metadata) == "table" and metadata.id or nil
+        self:showProgress(string.format("Downloading %d of %d…", index, #documents))
+
+        if not id then
+            result.failed = result.failed + 1
+        elseif local_ids[id] then
+            result.already_downloaded = result.already_downloaded + 1
+            result.completed_ids[id] = true
+            result.downloaded_ids[id] = true
+        else
+            local request_ok, document, request_err = pcall(
+                self.reader_api.getDocument, self.reader_api, id)
+            if not request_ok or not document then
+                logger.warn("ReadwiseReader:downloadReaderDocuments: full-content request failed for", id,
+                    request_ok and request_err or document)
+                result.failed = result.failed + 1
+            else
+                -- Keep useful list metadata when a malformed detail field was
+                -- omitted, without ever replacing the returned full HTML.
+                for key, value in pairs(metadata) do
+                    if document[key] == nil and key ~= "html_content" then
+                        document[key] = value
+                    end
+                end
+                self:rememberReaderDocumentClassification(document)
+                local download_ok, status = pcall(self.downloadDocument, self, document, {
+                    ignore_filters = true,
+                    already_checked = true,
+                })
+                if not download_ok then
+                    logger.warn("ReadwiseReader:downloadReaderDocuments: document pipeline crashed for", id,
+                        status)
+                    result.failed = result.failed + 1
+                elseif status == "downloaded" then
+                    result.downloaded = result.downloaded + 1
+                    result.completed_ids[id] = true
+                    result.downloaded_ids[id] = true
+                    local_ids[id] = true
+                elseif status == "skipped" then
+                    result.skipped = result.skipped + 1
+                else
+                    result.failed = result.failed + 1
+                end
+            end
+        end
+
+        if index % 10 == 0 then
+            self:saveCollections()
+        end
+    end
+
+    self:saveCollections()
+    self:saveSettings()
+    self:hideProgress()
+    if FileManager.instance and result.downloaded > 0 then
+        FileManager.instance:onRefresh()
+    end
+    return result
 end
 
 function ReadwiseReader:processHtmlContent(content, document)

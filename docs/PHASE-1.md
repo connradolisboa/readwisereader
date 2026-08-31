@@ -18,15 +18,29 @@ setting that defaults to true; `document_cover_urls` records the URL used for a
 cache hit if the article is later re-downloaded. WebP, AVIF, GIF, SVG, missing/mismatched Content-Type,
 non-HTTPS URLs, and covers larger than 5 MB are deliberately skipped.
 
-**Phase 1B Part 1 metadata browser is implemented but not physically
-Kindle-verified.** `api/reader.lua` requests Reader list pages with
+**Phase 1B metadata browser, search, and selection/download are implemented but
+not physically Kindle-verified.** `api/reader.lua` requests Reader list pages with
 `withHtmlContent=false`, `withTags=true`, and a 25-item limit, normalizing only
 the metadata the UI needs. `ui/browser.lua` provides Browse Reader → Inbox,
-Later, and Shortlist with text-first rows, an InfoMessage details view, and a
-cursor-driven Load more item. It does not download documents, render covers,
-persist metadata, alter Reader state, or run sync/reconciliation. Downloaded
-markers come from one per-browser-session scan of the established article/book
-directories.
+Later, and Shortlist plus Search Library, a cursor-driven Load more action,
+reusable selection controls, details, and Download Selected. Browsing and search
+never fetch document HTML or cover thumbnails. Downloaded markers come from one
+per-browser-session scan of the established article/book directories.
+
+The public Reader v3 LIST REST API does not document search. Search therefore
+filters metadata locally using Lua-lowercased plain-substring matching over
+title, author, site name, summary, and tag names. It scans one 25-document page
+per action and exposes Search next page; it is partial until the user reaches the
+last page, and it is not full-text search. Results include Inbox, Later,
+Shortlist, and Archive documents but exclude Feed and child highlight/note rows.
+Non-ASCII text has no Unicode case-folding under Lua 5.1, so use matching case
+for those queries.
+
+Tap toggles `[ ]`/`[x]` and long press opens details. Download Selected checks
+one session-local ID set, skips already-local items, fetches full HTML by the
+documented LIST `id` parameter only now, and feeds each document sequentially to
+the existing `downloadDocument` pipeline. A per-document failure is counted and
+does not stop the batch. Successful and already-local rows gain `✓` immediately.
 
 ## Exact build order
 
@@ -48,13 +62,16 @@ directories.
 5. **Done —** create `api/reader.lua` and `ui/browser.lua`, then add “Browse
    Reader” with Inbox, Later, and Shortlist. Fetch metadata only, render
    title-first text rows, and load additional cursor pages only on demand.
-6. Part 2: use the verified KOReader multi-selection pattern, show selected count, ask
-   for Download confirmation, fetch HTML one document at a time, and reuse the
-   established document writer. Report downloaded, existing, skipped, and failed
-   counts; keep collection save checkpoints.
+6. **Done —** use the KOReader touch-menu pattern: tap toggles selection, hold
+   opens details, selected count stays visible, and download asks for confirmation.
+   Fetch HTML one document at a time and reuse the established writer. Report
+   downloaded, existing, skipped, and failed counts; keep collection checkpoints.
 7. Keep picker downloads separate from `synchronize()`: no highlight export,
    completion archive, archive cleanup, reconciliation, filter mutation, or
    `last_sync_time` update.
+8. **Done —** add metadata-only search using the public LIST endpoint with HTML
+   disabled. Scan one cursor page per action and label the UI/documentation so it
+   cannot be mistaken for full-text search.
 
 ## Files to create
 
@@ -62,8 +79,7 @@ directories.
 | --- | --- |
 | `readwisereader.koplugin/api/reader.lua` | Metadata list request and response normalization. |
 | `readwisereader.koplugin/library/covers.lua` | Temporary binary download and native cover installation. |
-| `readwisereader.koplugin/ui/browser.lua` | Metadata location browser, cursor pages, rows, and details. |
-| `readwisereader.koplugin/ui/picker.lua` | Future selection/download workflow. |
+| `readwisereader.koplugin/ui/browser.lua` | Shared browse/search rows, selection, details, and selected-download UI. |
 
 ## Existing functions: move later or leave untouched
 
@@ -91,45 +107,42 @@ directories.
   result aggregation if a KOReader-compatible harness is selected. No harness
   exists in this repository now.
 
-## Required manual verification
+## Required physical Kindle verification
 
-1. Run LuaJIT syntax/lint checks against the target KOReader release.
-2. With CoverBrowser enabled, verify a downloaded JPEG/PNG `image_url` appears
-   in mosaic and detailed-list modes after the required refresh/restart.
-3. Verify no-image and unreachable-image documents still create HTML, metadata,
-   and collections without crashing.
-4. Browse all three locations; select one/many, cancel once, then download and
-   confirm that only selected IDs are written.
-5. Disable network after download; local articles must open, and network errors
-   must leave state intact.
-6. Re-run automatic sync, finished archive, archived cleanup, and highlight
-   export with existing files; check collections, sidecars, filename matching,
-   and settings.
-7. Restart KOReader and verify the custom cover persists. To exercise cache reuse
-   without adding a re-download feature, remove a test article's local HTML file
-   while retaining `.readwise/covers/`, then sync and verify a cache-hit log
-   rather than another network download. Finally test a low-memory Kindle with
-   image-heavy content and slow/failing covers.
-
-### Phase 1B Part 1 browser verification
-
-1. Restart KOReader, open Readwise Reader, then Browse Reader.
-2. Open Inbox and verify the metadata page loads without creating an HTML file.
-3. Scroll through at least 20–30 entries and check title/author-or-site text.
-4. Check reading-time and percentage formatting, including rows with missing values.
-5. Confirm existing local documents have a `✓` marker and undiscovered ones do not.
-6. Open a document details message, verify available title, author, site, category,
-   location, reading time, progress, tags, summary, and Downloaded fields, then close it.
-7. Use Load more when available and confirm the next page appends without duplicate rows.
-8. Return to the location list, test Later and Shortlist, and test an empty location.
-9. Disable Wi-Fi, reopen Browse Reader, and verify a useful error rather than a crash.
-10. Re-enable Wi-Fi, verify existing downloaded articles still open, then run normal
-    sync and re-check covers, collections, cleanup, and highlight export.
+1. Restart KOReader, open Readwise Reader → Browse Reader → Inbox.
+2. Tap two rows and verify `[x]`; long-press one and verify details rather than a toggle.
+3. Choose Download selected (2), confirm, and verify both downloads finish sequentially.
+4. Verify EPUB-category documents route to Books and other documents to Articles.
+5. Verify both files use the established `[rw-id_<id>]` filename convention.
+6. Verify metadata sidecars, Reader location collections, and available covers.
+7. Return to the list and verify both rows show `✓` without restarting KOReader.
+8. Open Search Library, submit an exact article title, and scan additional pages if needed.
+9. Run a new search by author.
+10. Search a broader keyword known to occur in title, site, summary, or tags.
+11. Verify result rows contain no `nil` or empty separators and show location.
+12. Use Search next page and verify matches append without downloading HTML or covers.
+13. Select multiple search results and verify Download selected count updates.
+14. Download them and remain in the search results after the completion summary.
+15. Verify Books/Articles routing and filename conventions again.
+16. Verify metadata, collections, and covers for the search downloads.
+17. Long-press an undownloaded row and use Download; long-press a downloaded row
+    and verify details show Downloaded: Yes. (Open is not implemented.)
+18. Search nonsense through the final page and verify a clean zero-match state.
+19. Disable Wi-Fi, start a new search, and verify a clean network error with Retry.
+20. Re-enable Wi-Fi and retry successfully.
+21. Select a row already marked `✓`, download it, and verify Already downloaded: 1
+    with no full-content refetch or duplicate file.
+22. Run normal sync and verify browser downloads do not cause reconciliation,
+    archive, or `last_sync_time` regressions.
+23. Create/export a new KOReader highlight and verify the existing Readwise export.
+24. Test a batch containing one document whose content request fails; verify later
+    documents continue and the summary increments Failed.
+25. Restart KOReader and verify covers and local documents persist.
 
 ## Physical-device questions
 
 - Which KOReader version/build is installed?
-- Which verified multi-select/checkbox widget pattern is available there?
+- Does tap-toggle plus hold-for-details behave correctly on the installed touch menu?
 - Does custom-cover installation refresh CoverBrowser immediately, or require a
   metadata invalidation/restart?
 - Can the Kindle TLS stack fetch representative Reader `image_url` resources?
