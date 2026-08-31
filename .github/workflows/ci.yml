@@ -36,3 +36,14 @@ jobs:
             fi
           done
           exit $status
+
+      # Unit tests for the modules that stand alone from KOReader. They stub the
+      # HTTP transport, so CI never touches a real Readwise account.
+      - name: Unit tests
+        run: |
+          status=0
+          for f in tests/test_*.lua; do
+            echo "== $f"
+            luajit "$f" || status=1
+          done
+          exit $status

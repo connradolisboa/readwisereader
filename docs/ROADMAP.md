@@ -45,6 +45,23 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 
 ## Known API limitations
 
+- **There is no public write path for Reader-anchored highlights.** Verified
+  2026-08-31 against both surfaces. The documented Reader REST API exposes only
+  `save`, `list`, `update`, `bulk_update`, `delete` and `tags` -- no highlight
+  CREATE. Readwise's public MCP server (`https://mcp.readwise.io/sse`, OAuth via
+  `https://readwise.io/o/authorize/`) answers `tools/list` with exactly two
+  tools, `search` and `fetch`, and describes itself as providing "search and
+  retrieval capabilities ... for Chat and Deep Research". A
+  `reader_create_highlight` operation exists in Readwise's first-party
+  integration with some chat clients, but it is not reachable from this plugin
+  and must not be planned against. Re-check before revisiting Reader anchoring.
+- v2 highlight CREATE de-dupes on `title`/`author`/`text`/`source_url`, so
+  re-sending an unchanged highlight is a no-op server-side. An *edited* one is a
+  new highlight unless it carries a stable `highlight_url`, which the endpoint
+  treats as an update key.
+- The v2 CREATE response returns each affected book with a `modified_highlights`
+  array, which is the only trustworthy count of what actually landed.
+
 - Public Reader list data includes `reading_progress`, but UPDATE has no
   documented percentage or position field.
 - Documented writable locations are `new`, `later`, `archive`, and `feed`;
@@ -56,8 +73,10 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 ## Experimental future features
 
 - Multi-article Daily Digest EPUB.
-- True full-text search via a future documented REST endpoint or an explicitly
-  approved integration with Readwise's separate CLI/MCP products.
+- True full-text search via a future documented REST endpoint. The public MCP
+  server's `search` tool covers highlights rather than the Reader library, and
+  its OAuth flow is not something this plugin can drive on device, so it is not
+  a shortcut here.
 - Reader-to-Kindle highlight import.
 - Generated fallback covers for documents without `image_url`.
 - Clearly-labelled approximate progress mapping, only if testing justifies it.

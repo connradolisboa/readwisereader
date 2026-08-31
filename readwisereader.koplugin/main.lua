@@ -59,6 +59,7 @@ local util = require("util")
 local Covers = require("library/covers")
 local Paths = require("library/paths")
 local ReaderAPI = require("api/reader")
+local HighlightsAPI = require("api/highlights")
 local Browser = require("ui/browser")
 local _ = require("gettext")
 local T = FFIUtil.template
@@ -171,6 +172,13 @@ function ReadwiseReader:init()
     self.reader_api = ReaderAPI:new{
         request = function(method, endpoint)
             return self:callAPI(method, endpoint, nil, true)
+        end,
+    }
+    self.highlights_api = HighlightsAPI:new{
+        request = function(endpoint, method, body)
+            return self:makeJsonRequest(HIGHLIGHTS_API_ENDPOINT .. endpoint, method, body, {
+                ["Authorization"] = "Token " .. self.access_token,
+            })
         end,
     }
     self.browser = Browser:new{
@@ -655,11 +663,11 @@ function ReadwiseReader:parseAllBooks()
     return clippings
 end
 
-function ReadwiseReader:createHighlights(booknotes)
-    local json_headers = {
-        ["Authorization"] = "Token " .. self.access_token,
-    }
-
+-- Builds the book-level fields that decide which Readwise book a highlight
+-- joins. Readwise groups by title/author/source_url, so reproducing the Reader
+-- document's values verbatim is what gives the export its best chance of
+-- landing under the existing article rather than opening a parallel one.
+function ReadwiseReader:buildHighlightContext(booknotes)
     -- Prefer the persisted Reader record. It is the only reliable link once
     -- KOReader's clipping parser has reduced the source to a local filename.
     local reader_metadata = booknotes.file and self:getReaderMetadataFromFile(booknotes.file) or nil
@@ -681,60 +689,31 @@ function ReadwiseReader:createHighlights(booknotes)
         end
     end
 
-    local title = (reader_metadata and reader_metadata.title) or booknotes.title
-    local category = reader_metadata and reader_metadata.category == "epub" and "books" or "articles"
-    local exported, failures, order = 0, {}, 0
-    for _, chapter in ipairs(booknotes) do
-        for _, clipping in ipairs(chapter) do
-            order = order + 1
-            if type(clipping.text) ~= "string" or clipping.text == "" then
-                table.insert(failures, "empty highlight at order " .. order)
-                logger.warn("ReadwiseReader:createHighlights: skipping empty highlight for", title, "at order", order)
-            else
-                -- KOReader's parser gives chapter/clipping iteration order, but
-                -- page/XP pointers are not uniformly reliable for generated HTML.
-                -- A monotonic `order` is documented by Readwise and preserves that
-                -- reading order without claiming native Reader anchors.
-                local highlight = {
-                    text = clipping.text,
-                    title = title,
-                    author = correct_author,
-                    source_url = source_url,
-                    image_url = reader_metadata and reader_metadata.image_url or nil,
-                    source_type = "koreader",
-                    category = category,
-                    note = type(clipping.note) == "string" and clipping.note or nil,
-                    location = order,
-                    location_type = "order",
-                }
-                if type(clipping.time) == "number" and clipping.time > 0 then
-                    highlight.highlighted_at = os.date("!%Y-%m-%dT%TZ", clipping.time)
-                end
-                local result, err = self:makeJsonRequest(HIGHLIGHTS_API_ENDPOINT .. "/highlights", "POST",
-                    { highlights = { highlight } }, json_headers)
-                if result then
-                    exported = exported + 1
-                else
-                    local failure = "order " .. order .. ": " .. tostring(err)
-                    table.insert(failures, failure)
-                    logger.warn("ReadwiseReader:createHighlights: failed for", title, failure)
-                end
-            end
-        end
-    end
-    if exported == 0 and #failures > 0 then
-        return false, table.concat(failures, "; ")
-    end
-    return true, #failures > 0 and table.concat(failures, "; ") or nil
+    return {
+        title = (reader_metadata and reader_metadata.title) or booknotes.title,
+        author = correct_author,
+        source_url = source_url,
+        image_url = reader_metadata and reader_metadata.image_url or nil,
+        -- Only claim a category for documents we actually know came from
+        -- Reader. For a sideloaded EPUB the documented v2 default -- "articles"
+        -- if a source_url was given, otherwise "books" -- is more accurate than
+        -- anything we could infer, and the old code's blanket "articles" filed
+        -- every Kindle book under the wrong dashboard section.
+        category = reader_metadata and HighlightsAPI.mapCategory(reader_metadata.category) or nil,
+        -- The Reader read URL is the only stable, clickable base we have. For a
+        -- local book with no Reader record we fall back to its source URL, and
+        -- with neither we send no highlight_url at all -- Readwise's own
+        -- title/author/text/source_url de-duplication still applies.
+        highlight_url_base = (reader_metadata and reader_metadata.reader_url) or source_url,
+    }
 end
 
--- Runs the highlight export pipeline. Returns the count exported and, on a parse
--- failure, the error -- the caller words that message, since "continuing with article
--- sync" is only true on the sync path.
+-- Runs the highlight export pipeline. Returns the number of highlights Readwise
+-- confirmed and, on a parse failure, the error -- the caller words that message,
+-- since "continuing with article sync" is only true on the sync path.
 function ReadwiseReader:exportHighlights()
     self:showProgress("Exporting highlights to Readwise...")
 
-    local exported = 0
     local success, clippings = pcall(function() return self:parseAllBooks() end)
     if not success then
         self:hideProgress()
@@ -742,44 +721,38 @@ function ReadwiseReader:exportHighlights()
         return 0, clippings
     end
 
-    if next(clippings) ~= nil then
-        -- must not be `_`: that is the gettext upvalue, and overwriting it
-        -- breaks every later _("...") call
-        local errors
-        exported, errors = self:exportToReadwise(clippings)
-        if errors and #errors > 0 then
-            logger.warn("ReadwiseReader:exportHighlights: highlight export errors:", table.concat(errors, "; "))
-            UIManager:show(InfoMessage:new{
-                text = string.format("Highlight export failed for %d book(s):\n%s",
-                    #errors, errors[1]),
-                timeout = 5
-            })
-        end
+    if next(clippings) == nil then
+        self:hideProgress()
+        return 0, nil
+    end
+
+    local books = {}
+    for _title, booknotes in pairs(clippings) do
+        table.insert(books, {
+            booknotes = booknotes,
+            context = self:buildHighlightContext(booknotes),
+        })
+    end
+
+    local report = self.highlights_api:export(books)
+    logger.dbg("ReadwiseReader:exportHighlights: sent", report.sent, "confirmed", report.confirmed,
+        "skipped", #report.skipped, "failed", #report.failures)
+
+    -- Readwise silently ignores a highlight it considers a duplicate, so
+    -- `confirmed` being lower than `sent` is the normal steady state on a
+    -- re-sync and is not worth reporting as a problem. Only genuine rejections
+    -- are surfaced.
+    local problems, problem_count = HighlightsAPI.summarizeProblems(report, 3)
+    if problems then
+        logger.warn("ReadwiseReader:exportHighlights: highlight export problems:", problems)
+        UIManager:show(InfoMessage:new{
+            text = string.format("%d highlight(s) could not be exported:\n%s", problem_count, problems),
+            timeout = 5
+        })
     end
 
     self:hideProgress()
-    return exported, nil
-end
-
-function ReadwiseReader:exportToReadwise(clippings)
-    local exportables = {}
-    for _title, booknotes in pairs(clippings) do
-        table.insert(exportables, booknotes)
-    end
-    
-    local success_count = 0
-    local errors = {}
-    
-    for _, booknotes in ipairs(exportables) do
-        local success, err = self:createHighlights(booknotes)
-        if success then
-            success_count = success_count + 1
-        else
-            table.insert(errors, booknotes.title .. ": " .. (err or "Unknown error"))
-        end
-    end
-    
-    return success_count, errors
+    return report.confirmed, nil
 end
 
 function ReadwiseReader:isDocReady()
@@ -848,8 +821,13 @@ function ReadwiseReader:addToMainMenu(menu_items)
                                         timeout = 5
                                     })
                                 else
+                                    -- Readwise ignores highlights it already
+                                    -- has, so zero here means "nothing new",
+                                    -- not "nothing worked".
                                     UIManager:show(InfoMessage:new{
-                                        text = string.format("Exported %d highlight(s).", exported),
+                                        text = exported > 0
+                                            and string.format("Exported %d new or updated highlight(s).", exported)
+                                            or "No new highlights to export.",
                                         timeout = 3
                                     })
                                 end
@@ -2774,7 +2752,7 @@ function ReadwiseReader:synchronize()
     local msg = "Sync complete:"
     
     if highlights_exported > 0 then
-        msg = msg .. "\n" .. string.format("Exported highlights: %d books", highlights_exported)
+        msg = msg .. "\n" .. string.format("Exported highlights: %d", highlights_exported)
     end
     
     if downloaded > 0 then

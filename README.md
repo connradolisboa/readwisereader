@@ -14,7 +14,8 @@ A plugin for KOReader integration with the highlight saving and read later servi
 
 ## Limitations and Known Issues:
 - Unfortunately two way highlight syncing is not possible as the Readwise Reader API does not provide the location data required by KOReader.
-- Highlights that this plugin creates in Readwise will not link back to the original article in Readwise Reader. Again, this is an API limitation - see the discussion [here](https://github.com/tomtom800/readwisereader/issues/20). 
+- Highlights that this plugin creates in Readwise are not anchored inside the original article in Readwise Reader, so tapping one will not jump to the passage. This is an API limitation - see the discussion [here](https://github.com/tomtom800/readwisereader/issues/20). Neither the public Reader REST API nor Readwise's public MCP server offers any way to create a highlight against an existing Reader document (rechecked 2026-08-31; details in [ROADMAP.md](docs/ROADMAP.md)). The plugin does send each highlight with the Reader document's exact title, author and source URL, which is what lets Readwise group them under the right article rather than a separate one.
+- Exported highlights carry a stable `highlight_url` derived from the annotation's creation time, so editing a highlight in KOReader updates it in Readwise on the next sync instead of adding a second copy. Readwise documents this update path for a highlight's *text*; whether it also revises an already-uploaded note is unverified.
 - I am not planning to add any options to style the documents. However there are lots of tweaks you can apply as a user - see [here](https://koreader.rocks/user_guide/#L1-customizingappearance). 
 
 ## Installation:

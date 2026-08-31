@@ -22,7 +22,7 @@ uses `NetworkMgr:runWhenOnline()` before `synchronize()` runs.
 | Files/content | `downloadDocument()` writes `[rw-id_<id>] <safe title>.html`, then best-effort applies a Reader cover. `processHtmlContent()` rewrites responsive markup, fetches inline images, base64-embeds them, and applies an image budget. Missing HTML produces a small fallback page. |
 | Metadata/sidecars | `setDocumentMetadata()` writes `doc_props` and `custom_props` through `DocSettings.openSettingsFile():flushCustomMetadata(filepath)`, then broadcasts metadata invalidation. |
 | Collections | Optional `ReadCollection` maps Reader location to `Readwise: <Location>` and batches writes. |
-| Highlights | KOReader history and Kindle My Clippings are parsed; v2 highlights are created with stored author/source URL where possible. |
+| Highlights | KOReader history and Kindle My Clippings are parsed. `buildHighlightContext()` resolves the book-level fields from the stored Reader record; `api/highlights.lua` builds the payloads, batches them 100 per request, and reports what the server confirmed via `modified_highlights`. |
 | Completion/archive | A `.sdr` `summary.status == "complete"` causes PATCH-to-archive then local deletion. Archive cleanup compares remote IDs updated since `last_sync_time`. |
 | UI | Nested main-menu tables, `InfoMessage`, `InputDialog`, `ConfirmBox`, `MultiConfirmBox`, `SpinWidget`, and the download-directory picker. Progress is a replaced `InfoMessage`, not a cancelable progress widget. |
 
