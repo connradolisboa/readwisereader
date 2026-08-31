@@ -56,6 +56,7 @@ local rapidjson = require("rapidjson")
 local socket = require("socket")
 local socketutil = require("socketutil")
 local util = require("util")
+local Covers = require("library/covers")
 local _ = require("gettext")
 local T = FFIUtil.template
 
@@ -136,6 +137,10 @@ function ReadwiseReader:init()
     -- Initialize image download settings
     self.download_images = settings.download_images == nil and true or settings.download_images
     self.max_image_size_mb = settings.max_image_size_mb or 10
+
+    -- Covers are separate binary files managed by KOReader sidecars, not inline HTML images.
+    self.download_covers = settings.download_covers == nil and true or settings.download_covers
+    self.document_cover_urls = settings.document_cover_urls or {}
 
     -- Initialize max articles download limit
     self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
@@ -868,6 +873,16 @@ function ReadwiseReader:addToMainMenu(menu_items)
                                 end,
                                 callback = function()
                                     self.download_images = not self.download_images
+                                    self:saveSettings()
+                                end,
+                            },
+                            {
+                                text = "Download covers",
+                                checked_func = function()
+                                    return self.download_covers
+                                end,
+                                callback = function()
+                                    self.download_covers = not self.download_covers
                                     self:saveSettings()
                                 end,
                             },
@@ -1855,6 +1870,23 @@ function ReadwiseReader:downloadDocument(document)
     if success then
         logger.dbg("ReadwiseReader:downloadDocument: saved", document.id, "to", filepath)
 
+        -- Reader covers are cached separately and installed through KOReader's
+        -- native custom-cover sidecar support. A cover is always best-effort:
+        -- failure must not prevent metadata, collections, or the article itself.
+        if self.download_covers then
+            local cover_ok, cover_result = pcall(Covers.apply, document, filepath, {
+                cache_dir = self.directory .. ".readwise/covers",
+                cached_url = self.document_cover_urls[document.id],
+            })
+            if not cover_ok then
+                logger.warn("ReadwiseReader:downloadDocument: cover processing crashed for", document.id,
+                    cover_result)
+            elseif cover_result.cache_url then
+                self.document_cover_urls[document.id] = cover_result.cache_url
+                self:saveSettings()
+            end
+        end
+
         -- Write metadata sidecar file for KOReader library integration
         local status, err = pcall(function() self:setDocumentMetadata(filepath, document) end)
         if not status then
@@ -2540,6 +2572,8 @@ function ReadwiseReader:saveSettings()
         document_source_urls = self.document_source_urls,
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
+        download_covers = self.download_covers,
+        document_cover_urls = self.document_cover_urls,
         max_articles_to_download = self.max_articles_to_download,
         sync_only_koreader_tag = self.sync_only_koreader_tag,
     }

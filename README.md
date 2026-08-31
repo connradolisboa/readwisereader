@@ -50,6 +50,12 @@ If reporting a bug, especially one that causes KOReader to crash, please share l
 ## Development
 Notes for devs and power-users. Don't proceed unless you know the meaning of each step.
 
+## Project planning
+
+- [Architecture and API capability matrix](docs/ARCHITECTURE.md)
+- [Phased roadmap](docs/ROADMAP.md)
+- [Phase 1 build and Kindle verification plan](docs/PHASE-1.md)
+
 ### Test KOReader on Linux PC
 KOReader has [Linux release](https://github.com/koreader/koreader/wiki/Installation-on-desktop-linux), so it's a breeze to test this plugin on Linux.
 
