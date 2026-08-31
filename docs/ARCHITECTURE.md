@@ -2,9 +2,10 @@
 
 ## Current implementation
 
-The repository contains one runtime module: `readwisereader.koplugin/main.lua`
-(2,555 lines) plus `_meta.lua`. There are no vendored dependencies, tests,
-fixtures, or KOReader source files in this checkout.
+The repository contains `readwisereader.koplugin/main.lua`, focused helper
+modules under `api/`, `library/`, and `ui/`, plus `_meta.lua`. There are no
+vendored dependencies, tests, fixtures, or KOReader source files in this
+checkout.
 
 `ReadwiseReader` is a `WidgetContainer`. `init()` opens
 `settings/readwisereader.lua`, initializes state, and registers the menu.
@@ -17,7 +18,7 @@ uses `NetworkMgr:runWhenOnline()` before `synchronize()` runs.
 | --- | --- |
 | Settings | `LuaSettings` stores the access token, directory, filters, sync options, last-sync timestamp, document tag/location maps, author/source URL lookup maps, and the cover URL cache index. |
 | Authentication/API | `callAPI()` sends `Authorization: Token <token>` to Reader v3, retries Kindle `wantread`, and handles 429 `Retry-After`. `makeJsonRequest()` posts v2 highlight payloads. |
-| Document retrieval | `getDocumentList()` pages `new`, `later`, and `shortlist`, requesting `withHtmlContent=true`; it filters and applies the sync limit while gathering. `getArchivedDocuments()` pages archive changes. |
+| Document retrieval | Automatic sync's `getDocumentList()` pages `new`, `later`, and `shortlist` with HTML. `api/reader.lua` separately fetches 25-item metadata-only pages for the browser. `getArchivedDocuments()` pages archive changes. |
 | Files/content | `downloadDocument()` writes `[rw-id_<id>] <safe title>.html`, then best-effort applies a Reader cover. `processHtmlContent()` rewrites responsive markup, fetches inline images, base64-embeds them, and applies an image budget. Missing HTML produces a small fallback page. |
 | Metadata/sidecars | `setDocumentMetadata()` writes `doc_props` and `custom_props` through `DocSettings.openSettingsFile():flushCustomMetadata(filepath)`, then broadcasts metadata invalidation. |
 | Collections | Optional `ReadCollection` maps Reader location to `Readwise: <Location>` and batches writes. |
@@ -110,9 +111,79 @@ Phase 1A created `library/covers.lua`. It streams HTTPS covers to
 or PNG signatures, and applies the cached file through `DocSettings`. The
 persisted `document_cover_urls` map avoids re-downloading a known usable cover
 when an article is re-downloaded; `download_covers` defaults to true.
-`api/reader.lua` and `ui/picker.lua` remain future work. Retain the filename
+`api/reader.lua` and `ui/browser.lua` now provide the metadata-only browser;
+the selection/download picker remains future work. Retain the filename
 format, `processHtmlContent`, clipping/export, collection calls, archive cleanup,
 and existing settings behavior until covered by tests and device verification.
+
+## Phase 1A.1 / 1A.2 implementation notes
+
+`library/paths.lua` is the single document-directory router. `epub` documents
+go to `book_directory`; every other supported Reader category goes to
+`article_directory`. Both settings fall back to the legacy `directory` value,
+and an unset book directory deliberately remains the article directory. Local
+ID lookup, completion/archive processing, archive cleanup, reconciliation, and
+cover caching enumerate both configured directories, so adding a second folder
+does not make existing documents invisible. Directories are created with the
+existing `util.makePath` convention at validation time; no files are moved.
+
+### Highlight export audit and behavior
+
+- KOReader annotations are read by `MyClipping:parseHistory()` in
+  `parseAllBooks()` after the open document is flushed. On Kindle,
+  `parseMyClippings()` is also read and replaces a history entry only when it
+  contains more notes. The parsed `booknotes` carries chapter arrays of
+  clippings plus its local `file` path.
+- `createHighlights()` uses `clipping.text` as Readwise `text` and maps
+  `clipping.note` directly to `note`; notes are never concatenated into text.
+- Download now stores `reader_metadata[document.id]` in the established Lua
+  settings object: id, title, author, source URL, Reader URL, category, site
+  name, and image URL when supplied by Reader. Export resolves this by the
+  existing `[rw-id_<id>]` filename. Older downloads fall back to the previous
+  author and source-URL maps and parsed title.
+- Payloads use the documented v2 fields only: text, title, author, source URL,
+  image URL, `source_type = "koreader"`, category, note, location,
+  location type, and a reliable clipping timestamp. Reader IDs and Reader URLs
+  are persisted locally but are not sent because the public create API exposes
+  no safe Reader-linkage field.
+- KOReader page/XP values are not reliable Reader text anchors for generated
+  HTML, so each parsed clipping receives a monotonically increasing integer
+  `location` with `location_type = "order"`. This preserves parser reading
+  order without claiming native Reader-position synchronization.
+- Each annotation is posted independently. A malformed or failed annotation is
+  logged with document title and order and does not stop later annotations.
+  Readwise performs duplicate protection by title, author, text, and source
+  URL; this plugin does not currently retain returned highlight IDs, because a
+  create response only groups modified IDs by source and cannot safely map them
+  back to individual clippings. No edit or deletion sync is added.
+
+## Phase 1B Part 1: metadata-only Reader browser
+
+`main.lua` owns the menu integration and established authenticated transport.
+`api/reader.lua` owns the `/list/` request shape and normalizes each valid API
+row into a compact metadata object: id, title, author, site, category, location,
+reading time/progress, image and source URLs, summary, update time, and tags.
+`ui/browser.lua` owns the text-first KOReader menu rows and information view.
+
+Browse Reader exposes only Inbox (`new`), Later (`later`), and Shortlist
+(`shortlist`). Each location loads its first 25 metadata-only entries with
+`withHtmlContent=false`, retaining only browser-session pages. A `Load more`
+row fetches the next Reader cursor page on demand; it never preloads the full
+library. Rows show title and the available author-or-site, reading time, and
+display-only progress. The details message shows available metadata, tags,
+summary, and local downloaded status.
+
+The downloaded marker is built once per browser session by scanning the existing
+centralized article/book directories and matching the established filename ID;
+there is no per-row filesystem scan and no metadata database. Browser errors
+are non-fatal: missing tokens, network failures, malformed rows, empty locations,
+and HTTP failures show a message and leave normal local reading and sync paths
+unchanged. The browser does not render thumbnails, fetch HTML, create files,
+change Reader state, or synchronize progress.
+
+Phase 1B Part 2 may add selection state and a Download Selected action that
+feeds the existing downloader. It must keep browser downloading separate from
+automatic-sync reconciliation, archive, and timestamp mutation.
 
 ## Related
 

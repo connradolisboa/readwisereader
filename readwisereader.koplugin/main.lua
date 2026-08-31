@@ -57,6 +57,9 @@ local socket = require("socket")
 local socketutil = require("socketutil")
 local util = require("util")
 local Covers = require("library/covers")
+local Paths = require("library/paths")
+local ReaderAPI = require("api/reader")
+local Browser = require("ui/browser")
 local _ = require("gettext")
 local T = FFIUtil.template
 
@@ -110,7 +113,11 @@ function ReadwiseReader:init()
     
     local settings = self.readwise_settings:readSetting("readwisereader") or {}
     self.access_token = settings.access_token
+    -- `directory` remains the compatibility source of truth for users upgrading
+    -- from the one-folder plugin. New keys are optional and never relocate files.
     self.directory = settings.directory
+    self.article_directory = settings.article_directory or settings.directory
+    self.book_directory = settings.book_directory
     -- on by default; `~= false` keeps an explicit opt-out working
     self.archive_finished = settings.archive_finished ~= false
     self.export_highlights_at_sync = settings.export_highlights_at_sync or false
@@ -133,6 +140,7 @@ function ReadwiseReader:init()
 
     -- Initialize source URL metadata storage (for highlight export)
     self.document_source_urls = settings.document_source_urls or {}
+    self.reader_metadata = settings.reader_metadata or {}
 
     -- Initialize image download settings
     self.download_images = settings.download_images == nil and true or settings.download_images
@@ -160,6 +168,22 @@ function ReadwiseReader:init()
         }
     }
     self.parser = MyClipping:new{ ui = mock_ui, settings = {} }
+    self.reader_api = ReaderAPI:new{
+        request = function(method, endpoint)
+            return self:callAPI(method, endpoint, nil, true)
+        end,
+    }
+    self.browser = Browser:new{
+        reader_api = self.reader_api,
+        is_configured = function()
+            return type(self.access_token) == "string" and self.access_token ~= ""
+        end,
+        downloaded_ids = function()
+            return self:getDownloadedDocumentIds()
+        end,
+        show_progress = function(text) self:showProgress(text) end,
+        hide_progress = function() self:hideProgress() end,
+    }
     
     self.ui.menu:registerToMainMenu(self)
 end
@@ -303,6 +327,55 @@ function ReadwiseReader:getDocumentSourceUrlFromFile(filepath)
         return self:getStoredSourceUrl(doc_id)
     end
     return nil
+end
+
+-- Store the Reader fields that are useful after KOReader has only a local HTML
+-- file and its annotations. This is intentionally settings-backed like the
+-- existing author/source maps; older files simply use the established fallback.
+function ReadwiseReader:storeReaderMetadata(document)
+    if type(document) ~= "table" or type(document.id) ~= "string" or document.id == "" then
+        return
+    end
+    self.reader_metadata = self.reader_metadata or {}
+    self.reader_metadata[document.id] = {
+        id = document.id,
+        title = document.title,
+        author = document.author,
+        source_url = document.source_url,
+        reader_url = document.url,
+        category = document.category,
+        site_name = document.site_name,
+        image_url = document.image_url,
+    }
+    self:saveSettings()
+end
+
+function ReadwiseReader:getReaderMetadataFromFile(filepath)
+    local doc_id = self:getDocumentIdFromPath(filepath)
+    return doc_id and self.reader_metadata and self.reader_metadata[doc_id] or nil
+end
+
+function ReadwiseReader:removeReaderMetadata(document_id)
+    if self.reader_metadata and self.reader_metadata[document_id] then
+        self.reader_metadata[document_id] = nil
+        self:saveSettings()
+    end
+end
+
+function ReadwiseReader:getDirectorySettings()
+    return {
+        directory = self.directory,
+        article_directory = self.article_directory,
+        book_directory = self.book_directory,
+    }
+end
+
+function ReadwiseReader:getDocumentDirectory(document)
+    return Paths.getDocumentDirectory(document, self:getDirectorySettings())
+end
+
+function ReadwiseReader:getAllDocumentDirectories()
+    return Paths.getAllDocumentDirectories(self:getDirectorySettings())
 end
 
 -- ===============================================================================
@@ -580,15 +653,19 @@ function ReadwiseReader:parseAllBooks()
 end
 
 function ReadwiseReader:createHighlights(booknotes)
-    local highlights = {}
     local json_headers = {
         ["Authorization"] = "Token " .. self.access_token,
     }
 
-    -- Try to get the correct author and source_url from stored metadata
+    -- Prefer the persisted Reader record. It is the only reliable link once
+    -- KOReader's clipping parser has reduced the source to a local filename.
+    local reader_metadata = booknotes.file and self:getReaderMetadataFromFile(booknotes.file) or nil
     local correct_author = nil
     local source_url = nil
-    if booknotes.file then
+    if reader_metadata then
+        correct_author = reader_metadata.author
+        source_url = reader_metadata.source_url
+    elseif booknotes.file then
         correct_author = self:getDocumentAuthorFromFile(booknotes.file)
         source_url = self:getDocumentSourceUrlFromFile(booknotes.file)
     end
@@ -601,32 +678,51 @@ function ReadwiseReader:createHighlights(booknotes)
         end
     end
 
+    local title = (reader_metadata and reader_metadata.title) or booknotes.title
+    local category = reader_metadata and reader_metadata.category == "epub" and "books" or "articles"
+    local exported, failures, order = 0, {}, 0
     for _, chapter in ipairs(booknotes) do
         for _, clipping in ipairs(chapter) do
-            local highlight = {
-                text = clipping.text,
-                title = booknotes.title,
-                author = correct_author,
-                source_url = source_url,
-                source_type = "koreader",
-                category = "articles",  -- Changed from "books" to "articles"
-                note = clipping.note,
-                location = clipping.page,
-                location_type = "order",
-                highlighted_at = os.date("!%Y-%m-%dT%TZ", clipping.time),
-            }
-            table.insert(highlights, highlight)
+            order = order + 1
+            if type(clipping.text) ~= "string" or clipping.text == "" then
+                table.insert(failures, "empty highlight at order " .. order)
+                logger.warn("ReadwiseReader:createHighlights: skipping empty highlight for", title, "at order", order)
+            else
+                -- KOReader's parser gives chapter/clipping iteration order, but
+                -- page/XP pointers are not uniformly reliable for generated HTML.
+                -- A monotonic `order` is documented by Readwise and preserves that
+                -- reading order without claiming native Reader anchors.
+                local highlight = {
+                    text = clipping.text,
+                    title = title,
+                    author = correct_author,
+                    source_url = source_url,
+                    image_url = reader_metadata and reader_metadata.image_url or nil,
+                    source_type = "koreader",
+                    category = category,
+                    note = type(clipping.note) == "string" and clipping.note or nil,
+                    location = order,
+                    location_type = "order",
+                }
+                if type(clipping.time) == "number" and clipping.time > 0 then
+                    highlight.highlighted_at = os.date("!%Y-%m-%dT%TZ", clipping.time)
+                end
+                local result, err = self:makeJsonRequest(HIGHLIGHTS_API_ENDPOINT .. "/highlights", "POST",
+                    { highlights = { highlight } }, json_headers)
+                if result then
+                    exported = exported + 1
+                else
+                    local failure = "order " .. order .. ": " .. tostring(err)
+                    table.insert(failures, failure)
+                    logger.warn("ReadwiseReader:createHighlights: failed for", title, failure)
+                end
+            end
         end
     end
-
-    local result, err = self:makeJsonRequest(HIGHLIGHTS_API_ENDPOINT .. "/highlights", "POST",
-         { highlights = highlights }, json_headers)
-
-    if not result then
-        logger.warn("ReadwiseReader: error creating highlights", err)
-        return false, err
+    if exported == 0 and #failures > 0 then
+        return false, table.concat(failures, "; ")
     end
-    return true
+    return true, #failures > 0 and table.concat(failures, "; ") or nil
 end
 
 -- Runs the highlight export pipeline. Returns the count exported and, on a parse
@@ -695,6 +791,12 @@ function ReadwiseReader:addToMainMenu(menu_items)
     menu_items.readwisereader = {
         text = "Readwise Reader",
         sub_item_table = {
+            {
+                text = "Browse Reader",
+                sub_item_table_func = function()
+                    return self.browser:getLocationItems()
+                end,
+            },
             {
                 text = "Sync now",
                 callback = function()
@@ -831,16 +933,27 @@ function ReadwiseReader:addToMainMenu(menu_items)
                     {
                         text_func = function()
                             local path
-                            if not self.directory or self.directory == "" then
+                            if not self.article_directory or self.article_directory == "" then
                                 path = "Not set"
                             else
-                                path = filemanagerutil.abbreviate(self.directory)
+                                path = filemanagerutil.abbreviate(self.article_directory)
                             end
-                            return string.format("Download folder: %s", BD.dirpath(path))
+                            return string.format("Article download directory: %s", BD.dirpath(path))
                         end,
                         keep_menu_open = true,
                         callback = function(touchmenu_instance)
-                            self:setDownloadDirectory(touchmenu_instance)
+                            self:setDownloadDirectory("article", touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local path = self.book_directory and filemanagerutil.abbreviate(self.book_directory)
+                                or "Same as article directory"
+                            return string.format("Book download directory: %s", BD.dirpath(path))
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:setDownloadDirectory("book", touchmenu_instance)
                         end,
                     },
                     {
@@ -1363,7 +1476,7 @@ function ReadwiseReader:validateSettings()
     end
 
     local token_empty = isEmpty(self.access_token)
-    local directory_empty = isEmpty(self.directory)
+    local directory_empty = isEmpty(self.article_directory or self.directory)
     
     if token_empty or directory_empty then
         UIManager:show(MultiConfirmBox:new{
@@ -1386,24 +1499,31 @@ function ReadwiseReader:validateSettings()
                 end
             end,
             choice2_callback = function() 
-                self:setDownloadDirectory() 
+                self:setDownloadDirectory("article")
             end,
         })
         return false
     end
 
-    local dir_mode = lfs.attributes(self.directory, "mode")
-    if dir_mode ~= "directory" then
-        UIManager:show(InfoMessage:new{
-            text = "The download folder is not valid.\nPlease configure it in the settings."
-        })
-        return false
+    for _, directory in ipairs(self:getAllDocumentDirectories()) do
+        if lfs.attributes(directory, "mode") ~= "directory" then
+            util.makePath(directory)
+            if lfs.attributes(directory, "mode") ~= "directory" then
+                UIManager:show(InfoMessage:new{
+                    text = "Could not create the download directory:\n" .. directory
+                })
+                return false
+            end
+        end
     end
 
-    if string.sub(self.directory, -1) ~= "/" then
-        self.directory = self.directory .. "/"
-        self:saveSettings()
+    -- Keep old callers that use self.directory on the article path.
+    self.article_directory = Paths.getArticleDirectory(self:getDirectorySettings())
+    self.directory = self.article_directory
+    if self.book_directory then
+        self.book_directory = Paths.getBookDirectory(self:getDirectorySettings())
     end
+    self:saveSettings()
 
     return true
 end
@@ -1438,10 +1558,20 @@ function ReadwiseReader:editSettings()
     self.settings_dialog:onShowKeyboard()
 end
 
-function ReadwiseReader:setDownloadDirectory(touchmenu_instance)
+function ReadwiseReader:setDownloadDirectory(kind, touchmenu_instance)
+    -- Compatibility for third-party callers which used the old one-argument API.
+    if type(kind) ~= "string" then
+        touchmenu_instance = kind
+        kind = "article"
+    end
     require("ui/downloadmgr"):new{
         onConfirm = function(path)
-            self.directory = path
+            if kind == "book" then
+                self.book_directory = path
+            else
+                self.article_directory = path
+                self.directory = path
+            end
             self:saveSettings()
             if touchmenu_instance then
                 touchmenu_instance:updateItems()
@@ -1697,15 +1827,19 @@ function ReadwiseReader:getArchivedDocuments(since_date)
 end
 
 function ReadwiseReader:forEachLocalDocument(callback)
-    for entry in lfs.dir(self.directory) do
-        if entry:match("%.html$") then
-            local filepath = self.directory .. entry
-            if lfs.attributes(filepath, "mode") == "file" then
-                local doc_id = self:getDocumentIdFromPath(filepath)
-                if doc_id then
-                    local result = callback(doc_id, filepath)
-                    if result ~= nil then
-                        return result
+    for _, directory in ipairs(self:getAllDocumentDirectories()) do
+        if lfs.attributes(directory, "mode") == "directory" then
+            for entry in lfs.dir(directory) do
+                if entry:match("%.html$") then
+                    local filepath = directory .. entry
+                    if lfs.attributes(filepath, "mode") == "file" then
+                        local doc_id = self:getDocumentIdFromPath(filepath)
+                        if doc_id then
+                            local result = callback(doc_id, filepath)
+                            if result ~= nil then
+                                return result
+                            end
+                        end
                     end
                 end
             end
@@ -1766,6 +1900,7 @@ function ReadwiseReader:deleteArchivedDocuments(targets)
         -- Remove metadata for archived documents
         self:removeAuthorMetadata(target.id)
         self:removeSourceUrlMetadata(target.id)
+        self:removeReaderMetadata(target.id)
         deleted_count = deleted_count + 1
     end
 
@@ -1800,6 +1935,7 @@ function ReadwiseReader:reconcileLocalDocuments(server_documents)
             FileManager:deleteFile(filepath, true)
             self:removeAuthorMetadata(doc_id)
             self:removeSourceUrlMetadata(doc_id)
+            self:removeReaderMetadata(doc_id)
             removed_count = removed_count + 1
         end
     end)
@@ -1810,6 +1946,16 @@ end
 
 function ReadwiseReader:documentExists(doc_id)
     return self:findLocalDocumentByReadwiseId(doc_id) ~= nil
+end
+
+-- Browser-session lookup: one scan across the centralized article/book paths,
+-- rather than a filesystem traversal for each metadata row.
+function ReadwiseReader:getDownloadedDocumentIds()
+    local ids = {}
+    self:forEachLocalDocument(function(doc_id)
+        ids[doc_id] = true
+    end)
+    return ids
 end
 
 function ReadwiseReader:downloadDocument(document)
@@ -1823,11 +1969,17 @@ function ReadwiseReader:downloadDocument(document)
         return "skipped"
     end
     
-    -- Store author metadata from the API
-    self:storeAuthorMetadata(document.id, document.author)
+    local directory = self:getDocumentDirectory(document)
+    if not directory or lfs.attributes(directory, "mode") ~= "directory" then
+        logger.warn("ReadwiseReader:downloadDocument: destination directory is unavailable for", document.id)
+        return "failed"
+    end
 
-    -- Store source URL for highlight export
+    -- Store source identity before writing the local file, so the exporter can
+    -- still use it even when the generated HTML has no recoverable URL metadata.
+    self:storeAuthorMetadata(document.id, document.author)
     self:storeSourceUrlMetadata(document.id, document.source_url)
+    self:storeReaderMetadata(document)
 
     -- Get HTML content (already fetched in getDocumentList)
     local content = document.html_content
@@ -1852,9 +2004,9 @@ function ReadwiseReader:downloadDocument(document)
         content = basic_content
     end
     
-    local title = util.getSafeFilename(document.title or "Untitled", self.directory, 200, 0)
+    local title = util.getSafeFilename(document.title or "Untitled", directory, 200, 0)
     local filename = article_id_prefix .. document.id .. article_id_postfix .. title .. ".html"
-    local filepath = self.directory .. filename
+    local filepath = directory .. filename
     
     local processed_content = self:processHtmlContent(content, document)
     
@@ -1875,7 +2027,7 @@ function ReadwiseReader:downloadDocument(document)
         -- failure must not prevent metadata, collections, or the article itself.
         if self.download_covers then
             local cover_ok, cover_result = pcall(Covers.apply, document, filepath, {
-                cache_dir = self.directory .. ".readwise/covers",
+                cache_dir = directory .. ".readwise/covers",
                 cached_url = self.document_cover_urls[document.id],
             })
             if not cover_ok then
@@ -2324,6 +2476,7 @@ function ReadwiseReader:archiveDocument(document_id)
         -- Remove metadata when document is archived
         self:removeAuthorMetadata(document_id)
         self:removeSourceUrlMetadata(document_id)
+        self:removeReaderMetadata(document_id)
         return true
     else
         logger.err("ReadwiseReader:archiveDocument: failed to archive", document_id, err)
@@ -2558,6 +2711,8 @@ function ReadwiseReader:saveSettings()
     local settings = {
         access_token = self.access_token,
         directory = self.directory,
+        article_directory = self.article_directory,
+        book_directory = self.book_directory,
         archive_finished = self.archive_finished,
         export_highlights_at_sync = self.export_highlights_at_sync,
         last_sync_time = self.last_sync_time,
@@ -2570,6 +2725,7 @@ function ReadwiseReader:saveSettings()
         document_locations = self.document_locations,
         document_authors = self.document_authors,
         document_source_urls = self.document_source_urls,
+        reader_metadata = self.reader_metadata,
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
         download_covers = self.download_covers,

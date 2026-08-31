@@ -5,12 +5,15 @@ and Kindle-to-Readwise highlight export remain in place throughout.
 
 ## Phase 1: native covers and selected downloads
 
-- Add a metadata-only Reader list path for Inbox (`new`), Later, and Shortlist.
-- Add a Kindle-friendly KOReader picker that selects documents before download.
+- **Part 1 implemented, not Kindle-verified:** a metadata-only Reader browser
+  for Inbox (`new`), Later, and Shortlist. It uses 25-item cursor pages, shows
+  text-first metadata and local downloaded state, and never fetches HTML.
+- Part 2: add a Kindle-friendly KOReader selection flow and Download Selected.
 - Fetch full HTML only for selected documents.
 - Fetch `image_url` best-effort and install it with `DocSettings:flushCustomCover`
   so bundled CoverBrowser modes can use it.
-- Preserve existing automatic sync and settings/filename conventions.
+- Preserve existing automatic sync and settings/filename conventions. Browser
+  pages are online-only session state; no offline metadata cache yet.
 
 See [the detailed Phase 1 plan](PHASE-1.md).
 
