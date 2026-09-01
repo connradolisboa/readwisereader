@@ -3,6 +3,7 @@
 local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local Trapper = require("ui/trapper")
 local UIManager = require("ui/uimanager")
 
 local Browser = {}
@@ -238,7 +239,8 @@ function Browser:showDownloadSummary(result)
     end
     UIManager:show(InfoMessage:new{
         text = string.format(
-            "Download complete:\nDownloaded: %d\nAlready downloaded: %d\nSkipped: %d\nFailed: %d",
+            "%s\nDownloaded: %d\nAlready downloaded: %d\nSkipped: %d\nFailed: %d",
+            result.aborted and "Download cancelled. Finished articles were kept:" or "Download complete:",
             result.downloaded or 0,
             result.already_downloaded or 0,
             result.skipped or 0,
@@ -247,12 +249,18 @@ function Browser:showDownloadSummary(result)
 end
 
 function Browser:download(document_list, menu)
-    local result = self.download_documents(document_list)
-    self:applyDownloadResult(result)
-    self:showDownloadSummary(result)
-    if menu then
-        menu:updateItems()
-    end
+    -- Run the whole download inside a coroutine so the progress dialog's Cancel
+    -- button can be dispatched between articles. Result handling stays inside
+    -- the wrap: the call returns at the first yield, so anything left outside
+    -- would run before the download had finished.
+    Trapper:wrap(function()
+        local result = self.download_documents(document_list)
+        self:applyDownloadResult(result)
+        self:showDownloadSummary(result)
+        if menu then
+            menu:updateItems()
+        end
+    end)
 end
 
 function Browser:showDocumentInfo(document, menu)

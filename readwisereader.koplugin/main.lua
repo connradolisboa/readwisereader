@@ -42,6 +42,7 @@ if not ok then
 end
 local MyClipping = require("clip")
 local NetworkMgr = require("ui/network/manager")
+local Trapper = require("ui/trapper")
 local ReadHistory = require("readhistory")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -58,9 +59,11 @@ local socketutil = require("socketutil")
 local util = require("util")
 local Covers = require("library/covers")
 local Paths = require("library/paths")
+local Progress = require("library/progress")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
 local Browser = require("ui/browser")
+local DownloadProgress = require("ui/downloadprogress")
 local _ = require("gettext")
 local T = FFIUtil.template
 
@@ -150,6 +153,18 @@ function ReadwiseReader:init()
     -- Covers are separate binary files managed by KOReader sidecars, not inline HTML images.
     self.download_covers = settings.download_covers == nil and true or settings.download_covers
     self.document_cover_urls = settings.document_cover_urls or {}
+
+    -- Reading position travels one way only. Reader's LIST exposes
+    -- reading_progress but UPDATE documents no percentage or position field, so
+    -- nothing is ever pushed back; the completion-to-archive path stays the only
+    -- device-to-Reader signal. Off by default because the mapping is approximate.
+    self.sync_reading_progress = settings.sync_reading_progress or false
+    -- What Reader reported the last time each document was examined, so an
+    -- unchanged position is not replayed on every sync.
+    self.progress_state = settings.progress_state or {}
+    -- Seeds wait here until the document is actually opened; persisted so a
+    -- restart between sync and reading does not lose them.
+    self.pending_progress_seeds = settings.pending_progress_seeds or {}
 
     -- Initialize max articles download limit
     self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
@@ -965,6 +980,20 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = "Start at Readwise Reader position",
+                        help_text = "When an article was read further in Readwise Reader on "
+                            .. "another device, jump to roughly that place on opening it here. "
+                            .. "The position is approximate, and it is never sent back: "
+                            .. "Readwise Reader's API has no way to store a position from KOReader.",
+                        checked_func = function()
+                            return self.sync_reading_progress
+                        end,
+                        callback = function()
+                            self.sync_reading_progress = not self.sync_reading_progress
+                            self:saveSettings()
+                        end,
+                    },
+                    {
                         text = "Image Download",
                         sub_item_table = {
                             {
@@ -1745,7 +1774,12 @@ function ReadwiseReader:getDocumentList()
                 
                 if result.results then
                     for _, doc in ipairs(result.results) do
-                        if doc.reading_progress < 1 then
+                        -- stripJsonNulls turns a JSON null into nil, so an absent
+                        -- reading_progress must not reach a numeric comparison.
+                        -- Treat a missing value as unread rather than dropping the
+                        -- document.
+                        local progress = tonumber(doc.reading_progress)
+                        if progress == nil or progress < 1 then
                             -- Apply tag/location filtering during collection
                             if not self:shouldSkipDocument(doc) then
                                 table.insert(documents, doc)
@@ -1996,8 +2030,21 @@ function ReadwiseReader:downloadDocument(document, options)
     local title = util.getSafeFilename(document.title or "Untitled", directory, 200, 0)
     local filename = article_id_prefix .. document.id .. article_id_postfix .. title .. ".html"
     local filepath = directory .. filename
-    
+
+    -- The article text itself came over the wire from Readwise; images add to
+    -- this as they are fetched inside processHtmlContent.
+    if self.active_progress then
+        self.active_progress:addBytes(#content)
+    end
+
     local processed_content = self:processHtmlContent(content, document)
+
+    -- Cancelling during image fetching leaves a half-assembled document. Stop
+    -- before writing anything, so a cancelled sync never leaves a partial file.
+    if self.active_progress and self.active_progress:isCancelled() then
+        logger.dbg("ReadwiseReader:downloadDocument: cancelled before writing", document.id)
+        return "cancelled"
+    end
     
     local file, err = io.open(filepath, "w")
     if not file then
@@ -2038,6 +2085,19 @@ function ReadwiseReader:downloadDocument(document, options)
         local coll_status, coll_err = pcall(function() self:updateDocumentCollections(filepath, document) end)
         if not coll_status then
             logger.warn("ReadwiseReader:downloadDocument: collection update failed:", coll_err)
+        end
+
+        -- Carry over an in-progress Reader position on a first download. Like
+        -- covers, this is best-effort: it must never fail the article itself.
+        if self.sync_reading_progress then
+            local seed_ok, seeded = pcall(function()
+                return self:seedReadingProgress(document, filepath)
+            end)
+            if not seed_ok then
+                logger.warn("ReadwiseReader:downloadDocument: progress seeding crashed for", document.id, seeded)
+            elseif seeded then
+                self:saveSettings()
+            end
         end
 
         return "downloaded"
@@ -2093,9 +2153,23 @@ function ReadwiseReader:downloadReaderDocuments(documents)
     local local_ids = self:getDownloadedDocumentIds()
     self:initCollectionTracking()
 
+    local progress = DownloadProgress.start{
+        title = "Downloading selected",
+        total = #documents,
+    }
+    self.active_progress = progress
+
     for index, metadata in ipairs(documents) do
         local id = type(metadata) == "table" and metadata.id or nil
-        self:showProgress(string.format("Downloading %d of %d…", index, #documents))
+        if progress then
+            local label = type(metadata) == "table" and metadata.title or nil
+            if progress:update({ done = index - 1, item = label, force = true }) then
+                result.aborted = true
+                break
+            end
+        else
+            self:showProgress(string.format("Downloading %d of %d…", index, #documents))
+        end
 
         if not id then
             result.failed = result.failed + 1
@@ -2134,16 +2208,29 @@ function ReadwiseReader:downloadReaderDocuments(documents)
                     local_ids[id] = true
                 elseif status == "skipped" then
                     result.skipped = result.skipped + 1
+                elseif status == "cancelled" then
+                    result.aborted = true
                 else
                     result.failed = result.failed + 1
                 end
             end
         end
 
+        if result.aborted then
+            break
+        end
+
         if index % 10 == 0 then
             self:saveCollections()
         end
     end
+
+    if progress then
+        progress:update({ done = result.downloaded + result.already_downloaded + result.skipped + result.failed,
+            force = true })
+        progress:close()
+    end
+    self.active_progress = nil
 
     self:saveCollections()
     self:saveSettings()
@@ -2477,7 +2564,13 @@ end
 -- Enhanced image fetching with size limits and cumulative size tracking
 function ReadwiseReader:fetchAndEncodeImageWithSize(url, max_article_size, current_article_size)
     logger.dbg("ReadwiseReader:fetchAndEncodeImageWithSize: attempting to fetch", url)
-    
+
+    -- Once cancelled, stop pulling images so the enclosing gsub unwinds quickly.
+    -- The half-built document is discarded by downloadDocument, not written.
+    if self.active_progress and self.active_progress:isCancelled() then
+        return nil, 0
+    end
+
     -- Check if image downloading is disabled
     if not self.download_images then
         logger.dbg("ReadwiseReader:fetchAndEncodeImageWithSize: image downloading disabled, skipping", url)
@@ -2530,7 +2623,14 @@ function ReadwiseReader:fetchAndEncodeImageWithSize(url, max_article_size, curre
     local mime_type = headers and headers["content-type"] or "image/jpeg"
     
     logger.dbg("ReadwiseReader:fetchAndEncodeImageWithSize: successfully encoded image", #image_data, "bytes, mime type:", mime_type)
-    
+
+    -- Count what came over the wire, not the inflated base64, so the figure
+    -- shown matches what was actually downloaded. tick() only redraws: a yield
+    -- here would cross the enclosing gsub's C-call boundary and raise.
+    if self.active_progress then
+        self.active_progress:addBytes(#image_data)
+    end
+
     return string.format("data:%s;base64,%s", mime_type, encoded), encoded_size
 end
 
@@ -2636,7 +2736,188 @@ function ReadwiseReader:processFinishedDocuments()
     return archived_count, deleted_count
 end
 
+-- ===============================================================================
+-- READING PROGRESS (READER TO DEVICE ONLY)
+-- ===============================================================================
+-- Reader's UPDATE endpoint documents no percentage or position field, so this is
+-- deliberately one-way and the mapping is approximate: Reader measures progress
+-- over its own rendering while KOReader paginates the HTML processHtmlContent
+-- generates. The policy lives in library/progress.lua; only I/O is here.
+
+-- True while the given file is the document currently open, in which case its
+-- sidecar belongs to ReaderUI and must not be written behind its back.
+function ReadwiseReader:isDocumentOpen(filepath)
+    local document = self.ui and self.ui.document
+    return document ~= nil and document.file == filepath
+end
+
+function ReadwiseReader:readLocalProgressState(filepath)
+    if not DocSettings:hasSidecarFile(filepath) then
+        return nil, nil
+    end
+
+    local ok_read, percent = pcall(function()
+        return DocSettings:open(filepath):readSetting("percent_finished")
+    end)
+
+    -- The sidecar's mtime is when the device last recorded a position, which is
+    -- what decides a tie against Reader's last_opened_at.
+    local mtime
+    local ok_path, sidecar = pcall(function()
+        return DocSettings:findSidecarFile(filepath)
+    end)
+    if ok_path and type(sidecar) == "string" then
+        mtime = lfs.attributes(sidecar, "modification")
+    end
+
+    return ok_read and tonumber(percent) or nil, mtime
+end
+
+-- Write percent_finished so the File Manager shows Reader's figure before the
+-- document is ever opened. The actual jump happens on open, in onReaderReady.
+function ReadwiseReader:writeSidecarPercent(filepath, percent)
+    if self:isDocumentOpen(filepath) then
+        return false
+    end
+    local ok_write = pcall(function()
+        local doc_settings = DocSettings:open(filepath)
+        doc_settings:saveSetting("percent_finished", percent)
+        doc_settings:flush()
+    end)
+    return ok_write
+end
+
+-- Records a seed for later application; never jumps directly, because the
+-- document is usually not open when sync runs.
+function ReadwiseReader:seedReadingProgress(document, filepath)
+    if not self.sync_reading_progress then
+        return false
+    end
+
+    local local_percent, sidecar_mtime = self:readLocalProgressState(filepath)
+    local seed, reason = Progress.decide(document, {
+        seen_last_opened_at = (self.progress_state[document.id] or {}).last_opened_at,
+        local_percent = local_percent,
+        sidecar_mtime = sidecar_mtime,
+    })
+
+    if not seed then
+        logger.dbg("ReadwiseReader:seedReadingProgress:", document.id, "not seeded -", reason)
+        -- Still record what Reader reported, so the next sync compares against
+        -- this observation rather than re-evaluating the same activity.
+        if document.last_opened_at then
+            self.progress_state[document.id] = { last_opened_at = document.last_opened_at }
+        end
+        return false
+    end
+
+    self:writeSidecarPercent(filepath, seed.percent)
+    self.pending_progress_seeds[document.id] = seed.percent
+    self.progress_state[document.id] = { last_opened_at = seed.last_opened_at }
+    logger.dbg("ReadwiseReader:seedReadingProgress: seeded", document.id, "at", seed.percent)
+    return true
+end
+
+-- Sync-time pass over documents already on the device: the case where an
+-- article was read further in Reader elsewhere since the last sync.
+function ReadwiseReader:reconcileReadingProgress(documents)
+    if not self.sync_reading_progress or type(documents) ~= "table" then
+        return 0
+    end
+
+    -- One directory scan for the whole pass, matching the browser's approach.
+    local local_paths = {}
+    self:forEachLocalDocument(function(doc_id, filepath)
+        local_paths[doc_id] = filepath
+    end)
+
+    local seeded = 0
+    for _, document in ipairs(documents) do
+        local filepath = document.id and local_paths[document.id]
+        if filepath then
+            local ok_seed, result = pcall(function()
+                return self:seedReadingProgress(document, filepath)
+            end)
+            if not ok_seed then
+                logger.warn("ReadwiseReader:reconcileReadingProgress: failed for", document.id, result)
+            elseif result then
+                seeded = seeded + 1
+            end
+        end
+    end
+
+    -- Articles are deleted locally once archived, so drop the bookkeeping for
+    -- anything no longer on the device rather than growing these maps forever.
+    for doc_id in pairs(self.pending_progress_seeds) do
+        if not local_paths[doc_id] then
+            self.pending_progress_seeds[doc_id] = nil
+        end
+    end
+    for doc_id in pairs(self.progress_state) do
+        if not local_paths[doc_id] then
+            self.progress_state[doc_id] = nil
+        end
+    end
+
+    -- saveSettings flushes the whole settings table, so the maps are mutated in
+    -- memory across the entire pass and written exactly once here.
+    self:saveSettings()
+
+    logger.dbg("ReadwiseReader:reconcileReadingProgress: seeded", seeded, "document(s)")
+    return seeded
+end
+
+-- Apply a pending seed when the document is opened. GotoPercent is used rather
+-- than the sidecar's last_percent because readerrolling honours last_percent
+-- only when last_xpointer is absent, and that branch is marked deprecated
+-- upstream; a re-seeded document usually has a local xpointer already.
+function ReadwiseReader:onReaderReady()
+    if not self.sync_reading_progress then
+        return
+    end
+
+    local document = self.ui and self.ui.document
+    local filepath = document and document.file
+    if not filepath then
+        return
+    end
+
+    local doc_id = self:getDocumentIdFromPath(filepath)
+    local percent = doc_id and tonumber(self.pending_progress_seeds[doc_id])
+    if not percent then
+        return
+    end
+
+    -- Cleared before the jump so a failure here cannot make the seed replay on
+    -- every open of this document.
+    self.pending_progress_seeds[doc_id] = nil
+    self:saveSettings()
+
+    UIManager:nextTick(function()
+        local ok_jump, err = pcall(function()
+            self.ui:handleEvent(Event:new("GotoPercent", percent * 100))
+        end)
+        if not ok_jump then
+            logger.warn("ReadwiseReader:onReaderReady: could not apply Reader position", err)
+            return
+        end
+        UIManager:show(InfoMessage:new{
+            text = string.format("Moved to your Readwise Reader position (about %d%%).", percent * 100),
+            timeout = 3,
+        })
+    end)
+end
+
 function ReadwiseReader:synchronize()
+    -- The download loop blocks, so UIManager never gets to dispatch a Cancel
+    -- tap unless the work runs in a coroutine that can yield back to it.
+    -- Trapper:wrap also keeps the device awake and logs any error with a
+    -- stacktrace, which a bare coroutine would swallow.
+    if not coroutine.running() then
+        Trapper:wrap(function() self:synchronize() end)
+        return
+    end
+
     local info = InfoMessage:new{ text = "Connecting to Readwise Reader…" }
     UIManager:show(info)
     
@@ -2689,6 +2970,14 @@ function ReadwiseReader:synchronize()
 
     -- Remove local articles that no longer match server state
     local reconciled_count = self:reconcileLocalDocuments(documents)
+
+    -- Move already-downloaded articles forward when Reader was read elsewhere.
+    -- Runs after reconciliation so a file about to be removed is never seeded.
+    if self.sync_reading_progress then
+        self:showProgress("Checking Readwise Reader positions…")
+        self:reconcileReadingProgress(documents)
+    end
+
     self:hideProgress()
 
     local filtered_documents = {}
@@ -2719,11 +3008,30 @@ function ReadwiseReader:synchronize()
     local downloaded = 0
     local skipped = 0
     local failed = 0
+    local cancelled = false
 
     self:initCollectionTracking()
 
+    -- Only raise the dialog when there is something to download; cleanup-only
+    -- runs reach here with an empty list and should not flash a bar.
+    local progress
+    if #filtered_documents > 0 then
+        progress = DownloadProgress.start{
+            title = "Downloading articles",
+            total = #filtered_documents,
+        }
+    end
+    self.active_progress = progress
+
     for i, document in ipairs(filtered_documents) do
-        self:showProgress(string.format("Downloading %d of %d: %s", i, #filtered_documents, document.title))
+        if progress then
+            if progress:update({ done = i - 1, item = document.title, force = true }) then
+                cancelled = true
+                break
+            end
+        else
+            self:showProgress(string.format("Downloading %d of %d: %s", i, #filtered_documents, document.title))
+        end
 
         local result = self:downloadDocument(document)
 
@@ -2731,8 +3039,14 @@ function ReadwiseReader:synchronize()
             downloaded = downloaded + 1
         elseif result == "skipped" then
             skipped = skipped + 1
+        elseif result == "cancelled" then
+            cancelled = true
         else
             failed = failed + 1
+        end
+
+        if cancelled then
+            break
         end
 
         -- Periodically save collection changes to prevent data loss on crash
@@ -2741,16 +3055,32 @@ function ReadwiseReader:synchronize()
         end
     end
 
+    if progress then
+        progress:update({ done = downloaded + skipped + failed, force = true })
+        progress:close()
+    end
+    self.active_progress = nil
+
     -- Final save for any remaining collection changes
     self:saveCollections()
 
     self:hideProgress()
-    
-    self.last_sync_time = sync_start_time
+
+    -- A cancelled run never saw the whole library, so leaving last_sync_time
+    -- untouched keeps the next archive-cleanup pass reasoning from the last
+    -- complete sync rather than from a partial one.
+    if not cancelled then
+        self.last_sync_time = sync_start_time
+    end
     self:saveSettings()
-    
-    local msg = "Sync complete:"
-    
+
+    local msg = cancelled and "Sync cancelled:" or "Sync complete:"
+
+    if cancelled then
+        msg = msg .. "\n" .. string.format("Stopped after %d of %d article(s). Everything already downloaded was kept.",
+            downloaded, #filtered_documents)
+    end
+
     if highlights_exported > 0 then
         msg = msg .. "\n" .. string.format("Exported highlights: %d", highlights_exported)
     end
@@ -2784,7 +3114,7 @@ function ReadwiseReader:synchronize()
         msg = msg .. "\n" .. string.format("Deleted locally: %d", deleted_count)
     end
     
-    if downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 then
+    if not cancelled and downloaded == 0 and skipped == 0 and failed == 0 and cleaned_count == 0 and archived_count == 0 and reconciled_count == 0 and existing_count == 0 and highlights_exported == 0 then
         msg = msg .. "\n" .. "No changes to process."
     end
     
@@ -2827,6 +3157,9 @@ function ReadwiseReader:saveSettings()
         document_cover_urls = self.document_cover_urls,
         max_articles_to_download = self.max_articles_to_download,
         sync_only_koreader_tag = self.sync_only_koreader_tag,
+        sync_reading_progress = self.sync_reading_progress,
+        progress_state = self.progress_state,
+        pending_progress_seeds = self.pending_progress_seeds,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()

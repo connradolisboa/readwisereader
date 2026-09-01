@@ -24,7 +24,7 @@ uses `NetworkMgr:runWhenOnline()` before `synchronize()` runs.
 | Collections | Optional `ReadCollection` maps Reader location to `Readwise: <Location>` and batches writes. |
 | Highlights | KOReader history and Kindle My Clippings are parsed. `buildHighlightContext()` resolves the book-level fields from the stored Reader record; `api/highlights.lua` builds the payloads, batches them 100 per request, and reports what the server confirmed via `modified_highlights`. |
 | Completion/archive | A `.sdr` `summary.status == "complete"` causes PATCH-to-archive then local deletion. Archive cleanup compares remote IDs updated since `last_sync_time`. |
-| UI | Nested main-menu tables, `InfoMessage`, `InputDialog`, `ConfirmBox`, `MultiConfirmBox`, `SpinWidget`, and the download-directory picker. Progress is a replaced `InfoMessage`, not a cancelable progress widget. |
+| UI | Nested main-menu tables, `InfoMessage`, `InputDialog`, `ConfirmBox`, `MultiConfirmBox`, `SpinWidget`, and the download-directory picker. Downloads show `ui/downloadprogress.lua`: a real progress bar with counts, bytes, and a Cancel button. Other long steps still use a replaced `InfoMessage`. |
 
 ### Current local state and risks
 
@@ -68,8 +68,9 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Cover/image URL | Official API, not implemented | List response includes `image_url`; use native custom covers. |
 | Full HTML/content | Supported by current code | `withHtmlContent=true`; Phase 1 should request it only per selected download. |
 | Original URL | Supported by current code | `source_url` is written to fallback HTML and stored for highlight export. |
-| Reading progress retrieval | Official API, not implemented | List response includes `reading_progress`. |
-| Reading progress update | Currently blocked | UPDATE documents `seen`, not a percentage/position write. |
+| Reading progress retrieval | Supported by current code | List returns `reading_progress` (0-1) plus `first_opened_at`, `last_opened_at`, `saved_at`, and `last_moved_at`. `library/progress.lua` decides when to move the device; `percent_finished` and a `GotoPercent` event apply it. |
+| Reading progress update | Currently blocked | Verified 2026-08-31: UPDATE and `bulk_update` accept only `title`, `author`, `summary`, `language`, `published_date`, `image_url`, `seen`, `location`, `category`, `tags`, `notes`. No percentage, position, offset, or scroll field, and `seen` is boolean. Completion-to-archive stays the only device-to-Reader signal. |
+| Local file upload to Reader | Not available | Verified 2026-08-31: `save` accepts `url` (required) and `html`, with no file-upload field and no multipart endpoint. EPUB/PDF/Markdown upload is web and mobile UI only, so a book already on the device cannot be pushed to Reader. |
 | Archive | Supported by current code | PATCH location to `archive`. |
 | Move Inbox/Later/Shortlist/Archive | Official API, partly constrained | UPDATE documents `new`, `later`, `archive`, `feed`; shortlist is listable but not documented as writable. |
 | Mark seen/unseen | Official API, not implemented | PATCH `seen`; it is boolean. |
@@ -82,8 +83,84 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 
 The public API documents token authentication, paginated list requests,
 optional HTML, `image_url`, metadata, `reading_progress`, update fields, tags,
-bulk update, and delete. It does not document progress-position writes, Daily
-Digest, or search. See [Reader API](https://readwise.io/reader_api).
+bulk update, and delete. It does not document progress-position writes, file
+uploads, Daily Digest, or search. See [Reader API](https://readwise.io/reader_api).
+
+## Download progress and cancellation
+
+`ui/downloadprogress.lua` is the cancelable download dialog used by both the
+sync loop and the picker's selected-download flow. It shows a title, an
+"N of M / K remaining" headline, a `ProgressWidget` bar over completed
+documents, the current article's title, cumulative bytes fetched, and a Cancel
+button.
+
+It does not use KOReader's stock `ProgressbarDialog`: that widget only arrived
+in mid-2025 and may be missing from an installed Kindle build, its texts are
+fixed at construction, and it cancels by tapping anywhere rather than with a
+button. This dialog is assembled from `ProgressWidget`, `TextWidget`, `Button`
+and the standard containers, all of which have been in KOReader since 2013-2017.
+Construction is wrapped in `pcall`; if it fails, both loops fall back to the
+existing `showProgress` messages and simply run without a Cancel control.
+
+**Cancellation requires a coroutine.** A download loop blocks, so UIManager
+never gets to dispatch a Cancel tap. Following the pattern in KOReader's OTA
+updater, each `update()` schedules a resume on the next tick and yields; the
+Cancel button resumes early with the cancelled flag set. `synchronize()`
+re-enters itself through `Trapper:wrap` when it is not already in a coroutine,
+and `Browser:download` wraps the whole picker download -- including result
+handling, because the wrapped call returns at the first yield, so anything left
+outside the wrap would run before the download finished.
+
+**`tick()` versus `update()`.** LuaJIT cannot yield across a C-call boundary,
+and image fetching happens inside `string.gsub` callbacks in
+`processHtmlContent`. `update()` redraws *and* yields and must only be called
+between documents; `tick()` (and `addBytes`, which it backs) only redraws and is
+what `fetchAndEncodeImageWithSize` calls. So byte totals keep moving during a
+long image-heavy article, but a Cancel press takes effect at the next document
+boundary rather than mid-article.
+
+Bytes reported are what came over the wire -- the article HTML plus each image's
+raw response -- not the inflated base64 or the final file size. No total size is
+predicted: base64 embedding and the image budget make an upfront estimate from
+the HTML alone badly wrong, so the bar tracks document count instead.
+
+Cancelling stops before the current document is written, so no partial file is
+left behind, and everything already downloaded is kept. A cancelled sync
+deliberately does not advance `last_sync_time`, so the next archive-cleanup pass
+still reasons from the last complete sync.
+
+## Reading progress
+
+Progress is one-way by necessity: Reader publishes `reading_progress` but offers
+no field to write a position to, so nothing is ever pushed back. The feature is
+off by default under `sync_reading_progress` and is presented as approximate,
+because Reader measures progress over its own rendering while KOReader paginates
+the HTML `processHtmlContent` generates.
+
+`library/progress.lua` holds the whole policy as a pure function so it can be
+tested without KOReader, matching the `paths.lua` (pure, tested) and
+`covers.lua` (I/O, not tested) split. Sidecar reads and writes stay in
+`main.lua` beside the existing `DocSettings` completion code.
+
+`Progress.decide` seeds only when Reader's progress is between 1% and 100%, the
+document was opened in Reader since the previous check (`last_opened_at`),
+Reader is more than a 2% dead band ahead of the sidecar's `percent_finished`,
+and the sidecar's mtime is older than Reader's `last_opened_at`. That last rule
+makes the device win a tie, so reading on the Kindle is never overwritten by a
+stale Reader position. ISO 8601 values are parsed to epoch seconds rather than
+compared as strings, because they are also compared against filesystem mtimes
+and Reader is not contractually stable about fractional seconds or zone format.
+
+Two paths record a seed: `downloadDocument` on a first download, and
+`reconcileReadingProgress` during sync for documents already on the device. Both
+only record; the jump happens in `onReaderReady`, which fires a `GotoPercent`
+event and clears the seed so it applies exactly once. `GotoPercent` is used
+rather than writing the sidecar's `last_percent` because `readerrolling` honours
+`last_percent` only when `last_xpointer` is absent, and marks that branch
+deprecated. `percent_finished` is still written at seed time so the File Manager
+shows Reader's figure before the document is opened. Because `saveSettings`
+flushes the entire settings table, the reconciliation pass mutates its maps in
+memory and writes once at the end.
 
 ## Target architecture
 

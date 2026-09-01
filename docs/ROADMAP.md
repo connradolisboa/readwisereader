@@ -37,6 +37,14 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 
 ## Phase 3: reading workflow improvements
 
+- **Implemented, not Kindle-verified:** clearly-labelled approximate progress
+  mapping from Reader to the device, off by default under "Start at Readwise
+  Reader position". A document is moved only when Reader was opened since the
+  last check, is more than a 2% dead band ahead of the sidecar's
+  `percent_finished`, and was opened in Reader more recently than the sidecar was
+  written -- so a tie goes to the device and local reading is never overwritten.
+  The jump is applied once, on open, through a `GotoPercent` event. See
+  [Architecture](ARCHITECTURE.md).
 - Determine whether KOReader reading state can map usefully to generated HTML.
 - Investigate a Daily Digest EPUB only after a supported data source and
   Kindle-native EPUB workflow are confirmed.
@@ -62,12 +70,24 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 - The v2 CREATE response returns each affected book with a `modified_highlights`
   array, which is the only trustworthy count of what actually landed.
 
-- Public Reader list data includes `reading_progress`, but UPDATE has no
-  documented percentage or position field.
+- **Reading position cannot be sent to Reader.** Verified 2026-08-31. Public
+  list data includes `reading_progress`, but UPDATE and `bulk_update` accept only
+  `title`, `author`, `summary`, `language`, `published_date`, `image_url`,
+  `seen`, `location`, `category`, `tags` and `notes`. There is no percentage,
+  position, offset or scroll field, and `seen` is boolean rather than a progress
+  substitute. Completion-to-archive remains the only device-to-Reader signal, so
+  progress support is Reader-to-device only.
+- **Local files cannot be uploaded to Reader.** Verified 2026-08-31. `save`
+  accepts `url` (required) and `html`; there is no file-upload field and no
+  multipart endpoint. EPUB, PDF and Markdown upload is web-drag-drop and
+  mobile-share-sheet only. An EPUB already on the device therefore cannot be
+  pushed to Reader and kept in sync. Converting one to HTML and posting it to
+  `save` would create an *article* with a second identity for a file the device
+  already holds, so it is deliberately not done. Highlights from local books do
+  reach Readwise through the existing v2 export.
 - Documented writable locations are `new`, `later`, `archive`, and `feed`;
   Shortlist is listable but not documented as writable.
 - No public Reader HTTP endpoint was found for Daily Digest or document search.
-- `seen` is boolean and not a progress substitute.
 - Exported highlights have no reliable reciprocal location map into generated HTML.
 
 ## Experimental future features
@@ -79,7 +99,6 @@ See [the detailed Phase 1 plan](PHASE-1.md).
   a shortcut here.
 - Reader-to-Kindle highlight import.
 - Generated fallback covers for documents without `image_url`.
-- Clearly-labelled approximate progress mapping, only if testing justifies it.
 
 ## Related
 

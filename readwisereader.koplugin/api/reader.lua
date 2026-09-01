@@ -59,6 +59,13 @@ function Reader.normalizeDocument(document)
         source_url = stringOrNil(document.source_url),
         summary = stringOrNil(document.summary),
         updated_at = stringOrNil(document.updated_at),
+        -- Reader read-only activity timestamps. last_opened_at is the freshness
+        -- signal the progress reconciler compares against local sidecar mtime;
+        -- Reader returns null for a document that was never opened.
+        first_opened_at = stringOrNil(document.first_opened_at),
+        last_opened_at = stringOrNil(document.last_opened_at),
+        saved_at = stringOrNil(document.saved_at),
+        last_moved_at = stringOrNil(document.last_moved_at),
         tags = normalizeTags(document.tags),
         url = stringOrNil(document.url),
         parent_id = stringOrNil(document.parent_id),
