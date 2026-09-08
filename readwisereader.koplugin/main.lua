@@ -29,6 +29,7 @@ local DocSettings = require("docsettings")
 local Event = require("ui/event")
 local FFIUtil = require("ffi/util")
 local FileManager = require("apps/filemanager/filemanager")
+local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local JSON = require("json")
@@ -177,10 +178,16 @@ function ReadwiseReader:init()
     self.sync_start_time = nil
     self.needs_rate_limiting = false
 
-    -- Initialize highlights parser with a mock UI to satisfy new clip.lua requirements
+    -- Initialize highlights parser with a mock UI to satisfy new clip.lua
+    -- requirements. extendProps is the one real dependency clip.lua pulls off
+    -- ui.bookinfo: it layers a book's user-edited custom metadata (set via
+    -- KOReader's own Book Info screen) over the doc_props KOReader already
+    -- extracted from the file itself, so a sideloaded EPUB's real title/author
+    -- (or a manual correction) reaches Readwise instead of just a filename
+    -- guess. It is a static function, so it needs no live UI instance.
     local mock_ui = {
         bookinfo = {
-            extendProps = function(props) return props or {} end
+            extendProps = FileManagerBookInfo.extendProps
         }
     }
     self.parser = MyClipping:new{ ui = mock_ui, settings = {} }
