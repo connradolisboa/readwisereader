@@ -77,6 +77,15 @@ check("location is 1-based order", h.location, 1)
 check("highlighted_at is ISO 8601 UTC", h.highlighted_at, "2023-11-14T22:13:21Z")
 check("note absent when unset", h.note, nil)
 
+print("\n== page location ==")
+local api_page, log_page = fakeApi()
+api_page:export({ book(2, { [1] = { page = 42 }, [2] = { page = "N/A" } }) })
+local page_highlights = log_page.requests[1].body.highlights
+check("numeric page wins over order", page_highlights[1].location_type, "page")
+check("numeric page value", page_highlights[1].location, 42)
+check("non-numeric page falls back to order", page_highlights[2].location_type, "order")
+check("order fallback is 1-based", page_highlights[2].location, 2)
+
 print("\n== notes are carried ==")
 local api2, log2 = fakeApi()
 api2:export({ book(1, { [1] = { note = "my annotation" } }) })

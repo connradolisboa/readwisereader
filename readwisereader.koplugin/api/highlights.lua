@@ -104,6 +104,19 @@ function Highlights.buildHighlight(clipping, context, order)
         return nil, string.format("note is %d characters, over the %d limit", #note, MAX_NOTE)
     end
 
+    -- clip.lua sets clipping.page to a real page number (pageref/pageno for
+    -- native highlights, or a parsed "Page N" for Kindle My Clippings) when it
+    -- has one. Kindle's location-range fallback and its untranslated "N/A"
+    -- placeholder both come through as strings, not numbers, so a numeric
+    -- check is what tells a genuine page apart from those. Without one, the
+    -- parser's iteration order is the only stable pointer we have.
+    local location, location_type
+    if type(clipping.page) == "number" then
+        location, location_type = clipping.page, "page"
+    else
+        location, location_type = order, "order"
+    end
+
     local highlight = {
         text = text,
         title = context.title,
@@ -113,11 +126,8 @@ function Highlights.buildHighlight(clipping, context, order)
         source_type = "koreader",
         category = context.category,
         note = note,
-        -- KOReader's page/XPointer values are not uniformly meaningful for the
-        -- generated HTML, but the parser's iteration order is. `order` is the
-        -- documented location_type for exactly that situation.
-        location = order,
-        location_type = "order",
+        location = location,
+        location_type = location_type,
         highlight_url = Highlights.buildHighlightUrl(context.highlight_url_base, clipping),
     }
     if type(clipping.time) == "number" and clipping.time > 0 then
