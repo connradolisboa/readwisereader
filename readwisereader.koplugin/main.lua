@@ -59,8 +59,10 @@ local socket = require("socket")
 local socketutil = require("socketutil")
 local util = require("util")
 local Covers = require("library/covers")
+local LocalLinks = require("library/local_links")
 local Paths = require("library/paths")
 local Progress = require("library/progress")
+local ProgressNote = require("library/progress_note")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
 local Browser = require("ui/browser")
@@ -94,6 +96,10 @@ local function stripJsonNulls(value)
         end
     end
     return value
+end
+
+local function roundedPercent(percent)
+    return math.floor(percent * 100 + 0.5)
 end
 
 local ReadwiseReader = WidgetContainer:extend{
@@ -146,6 +152,10 @@ function ReadwiseReader:init()
     -- Initialize source URL metadata storage (for highlight export)
     self.document_source_urls = settings.document_source_urls or {}
     self.reader_metadata = settings.reader_metadata or {}
+    -- Explicit associations for sideloaded books. These use the exact local
+    -- path, never a title match, so two editions with the same name cannot be
+    -- silently routed to the wrong Reader document.
+    self.local_book_links = settings.local_book_links or {}
 
     -- Initialize image download settings
     self.download_images = settings.download_images == nil and true or settings.download_images
@@ -216,6 +226,9 @@ function ReadwiseReader:init()
         end,
         show_progress = function(text) self:showProgress(text) end,
         hide_progress = function() self:hideProgress() end,
+        link_local_book = function(filepath, document)
+            return self:linkLocalBookToReader(filepath, document)
+        end,
     }
     
     self.ui.menu:registerToMainMenu(self)
@@ -393,6 +406,27 @@ function ReadwiseReader:removeReaderMetadata(document_id)
         self.reader_metadata[document_id] = nil
         self:saveSettings()
     end
+end
+
+function ReadwiseReader:getLocalBookLink(filepath)
+    return LocalLinks.get(self.local_book_links, filepath)
+end
+
+function ReadwiseReader:linkLocalBookToReader(filepath, document)
+    local link = LocalLinks.set(self.local_book_links, filepath, document)
+    if not link then
+        return nil
+    end
+    self:saveSettings()
+    return link
+end
+
+function ReadwiseReader:removeLocalBookLink(filepath)
+    if not LocalLinks.remove(self.local_book_links, filepath) then
+        return false
+    end
+    self:saveSettings()
+    return true
 end
 
 function ReadwiseReader:getDirectorySettings()
@@ -631,6 +665,206 @@ function ReadwiseReader:getDocumentClippings()
     return self.parser:parseCurrentDoc(self.view) or {}
 end
 
+function ReadwiseReader:getCurrentLocalBook()
+    local filepath = self.ui and self.ui.document and self.ui.document.file
+    if type(filepath) ~= "string" or filepath == "" then
+        return nil
+    end
+    local _, filename = util.splitFilePathName(filepath)
+    local title = filename:gsub("%.[^%.]+$", "")
+    return {
+        filepath = filepath,
+        title = title ~= "" and title or filename,
+    }
+end
+
+function ReadwiseReader:getLinkedCurrentLocalBook()
+    local local_book = self:getCurrentLocalBook()
+    local link = local_book and self:getLocalBookLink(local_book.filepath) or nil
+    return local_book, link
+end
+
+function ReadwiseReader:getCurrentLocalProgress(filepath)
+    if self.ui and self.ui.saveSettings then
+        pcall(function() self.ui:saveSettings() end)
+    end
+    local percent = self:readLocalProgressState(filepath)
+    if type(percent) ~= "number" or percent < 0 or percent > 1 then
+        return nil
+    end
+    return percent
+end
+
+function ReadwiseReader:getLinkedReaderDocument(link)
+    if type(link) ~= "table" or type(link.id) ~= "string" or link.id == "" then
+        return nil, "missing_link"
+    end
+    -- Progress/note actions need only metadata (including notes and
+    -- reading_progress), never the linked Reader book's HTML.
+    return self.reader_api:getDocument(link.id, false)
+end
+
+function ReadwiseReader:updateReaderDocumentNotes(document_id, notes)
+    if type(document_id) ~= "string" or document_id == "" then
+        return nil, "missing_document_id"
+    end
+    return self:callAPI("PATCH", "/update/" .. document_id .. "/", { notes = notes }, true)
+end
+
+function ReadwiseReader:showLinkedReaderDocumentError(err, status)
+    local message
+    if err == "not_found" then
+        message = "The linked Reader book was not found. Remove the link and choose it again."
+    elseif status == 401 or status == 403 then
+        message = "Reader authentication failed. Check your Readwise access token."
+    else
+        message = "Could not load the linked Reader book. Check your connection and try again."
+    end
+    UIManager:show(InfoMessage:new{ text = message, timeout = 4 })
+end
+
+function ReadwiseReader:sendCurrentProgressToReaderNote()
+    self:runSyncAction(function()
+        local local_book, link = self:getLinkedCurrentLocalBook()
+        if not local_book or not link then
+            UIManager:show(InfoMessage:new{ text = "Link the current local book to Reader first.", timeout = 3 })
+            return
+        end
+        local percent = self:getCurrentLocalProgress(local_book.filepath)
+        if percent == nil then
+            UIManager:show(InfoMessage:new{
+                text = "KOReader has not recorded a reading percentage for this book yet.",
+                timeout = 3,
+            })
+            return
+        end
+        local document, err, status = self:getLinkedReaderDocument(link)
+        if not document then
+            self:showLinkedReaderDocumentError(err, status)
+            return
+        end
+        local notes, changed = ProgressNote.upsert(document.notes, percent)
+        if not changed then
+            UIManager:show(InfoMessage:new{
+                text = string.format("Reader note already shows KOReader progress: %d%%.", roundedPercent(percent)),
+                timeout = 3,
+            })
+            return
+        end
+        local result, update_err, update_status = self:updateReaderDocumentNotes(document.id, notes)
+        if not result then
+            self:showLinkedReaderDocumentError(update_err, update_status)
+            return
+        end
+        UIManager:show(InfoMessage:new{
+            text = string.format("Added KOReader progress (%d%%) to the Reader note.", roundedPercent(percent)),
+            timeout = 3,
+        })
+    end)
+end
+
+function ReadwiseReader:applyReaderProgressToCurrentBook()
+    self:runSyncAction(function()
+        local local_book, link = self:getLinkedCurrentLocalBook()
+        if not local_book or not link then
+            UIManager:show(InfoMessage:new{ text = "Link the current local book to Reader first.", timeout = 3 })
+            return
+        end
+        local document, err, status = self:getLinkedReaderDocument(link)
+        if not document then
+            self:showLinkedReaderDocumentError(err, status)
+            return
+        end
+        local percent = tonumber(document.reading_progress)
+        if percent == nil or percent < 0 or percent > 1 then
+            UIManager:show(InfoMessage:new{
+                text = "Readwise Reader has no usable reading percentage for this book.",
+                timeout = 3,
+            })
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = string.format(
+                "Move the current KOReader book to about %d%%, using the Reader position?\n\n"
+                    .. "The two apps paginate differently, so this is approximate.", roundedPercent(percent)),
+            ok_text = "Move to position",
+            ok_callback = function()
+                UIManager:nextTick(function()
+                    local ok, jump_err = pcall(function()
+                        self.ui:handleEvent(Event:new("GotoPercent", percent * 100))
+                    end)
+                    if not ok then
+                        logger.warn("ReadwiseReader:applyReaderProgressToCurrentBook: could not apply position", jump_err)
+                        UIManager:show(InfoMessage:new{
+                            text = "Could not apply the Reader position to this book.",
+                            timeout = 3,
+                        })
+                        return
+                    end
+                    UIManager:show(InfoMessage:new{
+                        text = string.format("Moved to the Reader position (about %d%%).", roundedPercent(percent)),
+                        timeout = 3,
+                    })
+                end)
+            end,
+        })
+    end)
+end
+
+function ReadwiseReader:removeCurrentProgressFromReaderNote()
+    self:runSyncAction(function()
+        local local_book, link = self:getLinkedCurrentLocalBook()
+        if not local_book or not link then
+            UIManager:show(InfoMessage:new{ text = "Link the current local book to Reader first.", timeout = 3 })
+            return
+        end
+        local document, err, status = self:getLinkedReaderDocument(link)
+        if not document then
+            self:showLinkedReaderDocumentError(err, status)
+            return
+        end
+        local _, removed = ProgressNote.remove(document.notes)
+        if not removed then
+            UIManager:show(InfoMessage:new{
+                text = "The linked Reader note has no KOReader progress line to remove.",
+                timeout = 3,
+            })
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = "Remove only the KOReader progress line from this Reader note?\n\n"
+                .. "All of your other Reader note text will remain unchanged.",
+            ok_text = "Remove progress",
+            ok_callback = function()
+                -- Re-read after confirmation so a note edited in Reader while
+                -- the confirmation was open is preserved too.
+                local latest, latest_err, latest_status = self:getLinkedReaderDocument(link)
+                if not latest then
+                    self:showLinkedReaderDocumentError(latest_err, latest_status)
+                    return
+                end
+                local latest_notes, latest_removed = ProgressNote.remove(latest.notes)
+                if not latest_removed then
+                    UIManager:show(InfoMessage:new{
+                        text = "The KOReader progress line was already removed from the Reader note.",
+                        timeout = 3,
+                    })
+                    return
+                end
+                local result, update_err, update_status = self:updateReaderDocumentNotes(latest.id, latest_notes)
+                if not result then
+                    self:showLinkedReaderDocumentError(update_err, update_status)
+                    return
+                end
+                UIManager:show(InfoMessage:new{
+                    text = "Removed the KOReader progress line from the Reader note.",
+                    timeout = 3,
+                })
+            end,
+        })
+    end)
+end
+
 -- Entry point shared by the Advanced sync actions. They bypass synchronize(), so they
 -- must do for themselves what it does at its top: get online, validate settings, and
 -- reset the per-session rate-limit counters.
@@ -693,11 +927,16 @@ function ReadwiseReader:buildHighlightContext(booknotes)
     -- Prefer the persisted Reader record. It is the only reliable link once
     -- KOReader's clipping parser has reduced the source to a local filename.
     local reader_metadata = booknotes.file and self:getReaderMetadataFromFile(booknotes.file) or nil
+    -- A downloaded Reader HTML file has its own canonical metadata. A local
+    -- book only receives Reader fields after the user explicitly links it.
+    local local_book_link = not reader_metadata and booknotes.file
+        and self:getLocalBookLink(booknotes.file) or nil
+    local linked_metadata = reader_metadata or local_book_link
     local correct_author = nil
     local source_url = nil
-    if reader_metadata then
-        correct_author = reader_metadata.author
-        source_url = reader_metadata.source_url
+    if linked_metadata then
+        correct_author = linked_metadata.author
+        source_url = linked_metadata.source_url
     elseif booknotes.file then
         correct_author = self:getDocumentAuthorFromFile(booknotes.file)
         source_url = self:getDocumentSourceUrlFromFile(booknotes.file)
@@ -712,21 +951,21 @@ function ReadwiseReader:buildHighlightContext(booknotes)
     end
 
     return {
-        title = (reader_metadata and reader_metadata.title) or booknotes.title,
+        title = (linked_metadata and linked_metadata.title) or booknotes.title,
         author = correct_author,
         source_url = source_url,
-        image_url = reader_metadata and reader_metadata.image_url or nil,
+        image_url = linked_metadata and linked_metadata.image_url or nil,
         -- Only claim a category for documents we actually know came from
         -- Reader. For a sideloaded EPUB the documented v2 default -- "articles"
         -- if a source_url was given, otherwise "books" -- is more accurate than
         -- anything we could infer, and the old code's blanket "articles" filed
         -- every Kindle book under the wrong dashboard section.
-        category = reader_metadata and HighlightsAPI.mapCategory(reader_metadata.category) or nil,
+        category = linked_metadata and HighlightsAPI.mapCategory(linked_metadata.category) or nil,
         -- The Reader read URL is the only stable, clickable base we have. For a
         -- local book with no Reader record we fall back to its source URL, and
         -- with neither we send no highlight_url at all -- Readwise's own
         -- title/author/text/source_url de-duplication still applies.
-        highlight_url_base = (reader_metadata and reader_metadata.reader_url) or source_url,
+        highlight_url_base = (linked_metadata and linked_metadata.reader_url) or source_url,
     }
 end
 
@@ -801,6 +1040,88 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 sub_item_table_func = function()
                     return self.browser:getLocationItems()
                 end,
+            },
+            {
+                text = "Link current book to Reader…",
+                help_text = "Choose the exact Reader book for the local book currently open in KOReader. "
+                    .. "This does not download HTML and never links by title automatically.",
+                enabled_func = function()
+                    local local_book = self:getCurrentLocalBook()
+                    return local_book and self:getReaderMetadataFromFile(local_book.filepath) == nil
+                end,
+                callback = function(touchmenu_instance)
+                    local local_book = self:getCurrentLocalBook()
+                    if not local_book then
+                        UIManager:show(InfoMessage:new{
+                            text = "Open the local book you want to link first.",
+                            timeout = 3,
+                        })
+                        return
+                    end
+                    if self:getReaderMetadataFromFile(local_book.filepath) then
+                        UIManager:show(InfoMessage:new{
+                            text = "This downloaded Reader document is already linked to Reader.",
+                            timeout = 3,
+                        })
+                        return
+                    end
+                    self.browser:showLinkSearchDialog(local_book, touchmenu_instance)
+                end,
+            },
+            {
+                text = "Remove Reader link for current book",
+                enabled_func = function()
+                    local local_book = self:getCurrentLocalBook()
+                    return local_book and self:getLocalBookLink(local_book.filepath) ~= nil
+                end,
+                callback = function()
+                    local local_book = self:getCurrentLocalBook()
+                    if not local_book then
+                        return
+                    end
+                    UIManager:show(ConfirmBox:new{
+                        text = "Remove the Reader link for:\n" .. local_book.title
+                            .. "\n\nFuture highlights from this local book will use its own metadata instead.",
+                        ok_text = "Remove link",
+                        ok_callback = function()
+                            self:removeLocalBookLink(local_book.filepath)
+                            UIManager:show(InfoMessage:new{
+                                text = "Removed the Reader link for this local book.",
+                                timeout = 3,
+                            })
+                        end,
+                    })
+                end,
+            },
+            {
+                text = "Linked book progress",
+                help_text = "Manual actions for the current linked local book. Sending writes only a marked KOReader percentage line in the Reader document note.",
+                enabled_func = function()
+                    local _, link = self:getLinkedCurrentLocalBook()
+                    return link ~= nil
+                end,
+                sub_item_table = {
+                    {
+                        text = "Send KOReader progress to Reader note",
+                        callback = function()
+                            self:sendCurrentProgressToReaderNote()
+                        end,
+                    },
+                    {
+                        text = "Apply Reader progress to current book",
+                        help_text = "Moves the open book to Reader's percentage after confirmation. The position is approximate.",
+                        callback = function()
+                            self:applyReaderProgressToCurrentBook()
+                        end,
+                    },
+                    {
+                        text = "Remove KOReader progress from Reader note",
+                        help_text = "Removes only the marked KOReader progress line after confirmation.",
+                        callback = function()
+                            self:removeCurrentProgressFromReaderNote()
+                        end,
+                    },
+                },
             },
             {
                 text = "Sync now",
@@ -3158,6 +3479,7 @@ function ReadwiseReader:saveSettings()
         document_authors = self.document_authors,
         document_source_urls = self.document_source_urls,
         reader_metadata = self.reader_metadata,
+        local_book_links = self.local_book_links,
         download_images = self.download_images,
         max_image_size_mb = self.max_image_size_mb,
         download_covers = self.download_covers,

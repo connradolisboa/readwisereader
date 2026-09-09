@@ -57,6 +57,9 @@ function Reader.normalizeDocument(document)
         reading_progress = type(document.reading_progress) == "number" and document.reading_progress or nil,
         image_url = stringOrNil(document.image_url),
         source_url = stringOrNil(document.source_url),
+        -- The document note is used only to preserve unrelated user text while
+        -- a manual KOReader progress action replaces its own marked line.
+        notes = stringOrNil(document.notes),
         summary = stringOrNil(document.summary),
         updated_at = stringOrNil(document.updated_at),
         -- Reader read-only activity timestamps. last_opened_at is the freshness
@@ -164,12 +167,16 @@ end
 -- `id` and `withHtmlContent` are documented LIST parameters. This is the only
 -- full-content request made by picker/search flows, and only happens after the
 -- user asks to download a document.
-function Reader:getDocument(document_id)
+function Reader:getDocument(document_id, with_html_content)
     if type(document_id) ~= "string" or document_id == "" then
         return nil, "invalid_document"
     end
+    if with_html_content == nil then
+        with_html_content = true
+    end
     local endpoint = "/list/?id=" .. queryEscape(document_id)
-        .. "&withHtmlContent=true&withTags=true&limit=1"
+        .. "&withHtmlContent=" .. (with_html_content and "true" or "false")
+        .. "&withTags=true&limit=1"
     local response, err, status = self.request("GET", endpoint)
     if not response then
         return nil, err or "request_failed", status

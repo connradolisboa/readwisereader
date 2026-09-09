@@ -72,6 +72,8 @@ function Browser:new(options)
         downloaded_lookup = nil,
         selected = {},
         search = nil,
+        link_local_book = options.link_local_book,
+        link_search = nil,
     }, self)
 end
 
@@ -162,8 +164,9 @@ function Browser:loadSearch(append)
 end
 
 function Browser:rowText(document, show_location)
-    local selected = self.selected[document.id] and "[x] " or "[ ] "
-    local downloaded = self:getDownloadedLookup()[document.id] and "✓ " or ""
+    local plain = show_location == "plain"
+    local selected = plain and "" or (self.selected[document.id] and "[x] " or "[ ] ")
+    local downloaded = plain and "" or (self:getDownloadedLookup()[document.id] and "✓ " or "")
     local attribution = document.author or document.site_name
     local subtitle = joinParts(
         attribution,
@@ -172,6 +175,182 @@ function Browser:rowText(document, show_location)
         show_location and LOCATION_LABELS[document.location] or nil)
     local title = selected .. downloaded .. document.title
     return subtitle ~= "" and title .. "\n" .. subtitle or title
+end
+
+function Browser:showLinkDocumentInfo(document)
+    UIManager:show(InfoMessage:new{ text = self:formatDetails(document) })
+end
+
+function Browser:confirmLink(local_book, document, menu)
+    local attribution = document.author and ("\nAuthor: " .. document.author) or ""
+    UIManager:show(ConfirmBox:new{
+        text = "Link this local book to the selected Reader document?\n\n"
+            .. "Local: " .. local_book.title .. "\n"
+            .. "Reader: " .. document.title .. attribution
+            .. "\n\nThis does not download HTML. Future exports use this Reader document's "
+            .. "metadata, but Readwise does not provide a guaranteed Reader-anchored highlight API.",
+        ok_text = "Link",
+        ok_callback = function()
+            local link = self.link_local_book and self.link_local_book(local_book.filepath, document)
+            if not link then
+                self:showError("Could not save the local book link.")
+                return
+            end
+            UIManager:show(InfoMessage:new{
+                text = "Linked local book to:\n" .. document.title
+                    .. "\n\nUse Advanced sync → Export highlights to Readwise."
+            })
+            if menu then menu:updateItems() end
+        end,
+    })
+end
+
+function Browser:getLinkSearchItems()
+    local search = self.link_search
+    if not search then
+        return {}
+    end
+    local local_book = search.local_book
+    local items = {
+        {
+            text = "Linking local book: " .. local_book.title,
+            enabled = false,
+        },
+        {
+            text = "New search…",
+            keep_menu_open = true,
+            separator = true,
+            callback = function(menu) self:showLinkSearchDialog(local_book, menu) end,
+        },
+    }
+
+    for _, document in ipairs(search.documents) do
+        local row_document = document
+        table.insert(items, {
+            text_func = function() return self:rowText(row_document, "plain") end,
+            keep_menu_open = true,
+            callback = function(menu)
+                self:confirmLink(local_book, row_document, menu)
+            end,
+            hold_callback = function()
+                self:showLinkDocumentInfo(row_document)
+            end,
+        })
+    end
+
+    if #search.documents == 0 then
+        local status = search.load_failed
+            and "Search failed. No results were changed."
+            or search.next_cursor
+            and string.format("No matches in %d scanned documents yet.", search.scanned)
+            or string.format("No matches in %d scanned documents.", search.scanned)
+        table.insert(items, { text = status, enabled = false })
+    end
+    if search.load_failed then
+        table.insert(items, {
+            text = "Retry search page",
+            keep_menu_open = true,
+            callback = function(menu)
+                self:loadLinkSearch(search.scanned > 0)
+                if menu then replaceMenuItems(menu, self:getLinkSearchItems()) end
+            end,
+        })
+    end
+    if search.next_cursor and not search.load_failed then
+        table.insert(items, {
+            text = string.format("Search next page (%d scanned)", search.scanned),
+            keep_menu_open = true,
+            callback = function(menu)
+                self:loadLinkSearch(true)
+                if menu then replaceMenuItems(menu, self:getLinkSearchItems()) end
+            end,
+        })
+    end
+    return items
+end
+
+function Browser:loadLinkSearch(append)
+    local current = self.link_search
+    if not current then
+        return nil
+    end
+    local cursor = append and current.next_cursor or nil
+    if append and not cursor then
+        return current
+    end
+
+    self.show_progress(append and "Searching the next 25 Reader documents…"
+        or "Searching Reader metadata…")
+    local page, err, status = self.reader_api:searchMetadata(current.query, cursor)
+    self.hide_progress()
+    if not page then
+        current.load_failed = true
+        self:showError(self:errorText(err, status, "search"))
+        return nil
+    end
+    current.load_failed = nil
+    if append then
+        for _, document in ipairs(page.documents) do
+            table.insert(current.documents, document)
+        end
+        current.next_cursor = page.next_cursor
+        current.scanned = current.scanned + page.scanned
+    else
+        current.documents = page.documents
+        current.next_cursor = page.next_cursor
+        current.scanned = page.scanned
+    end
+    return current
+end
+
+function Browser:showLinkSearchDialog(local_book, menu)
+    if self.is_configured and not self.is_configured() then
+        self:showError("Configure your Readwise access token before linking a book.")
+        return
+    end
+    if type(local_book) ~= "table" or type(local_book.filepath) ~= "string" then
+        self:showError("Open a local book before linking it to Reader.")
+        return
+    end
+
+    local dialog
+    dialog = InputDialog:new{
+        title = "Find Reader book to link",
+        input = local_book.title or "",
+        input_hint = "Title or author",
+        description = "The local filename is only a search suggestion. Select the exact Reader book; no automatic title match is made.",
+        buttons = {
+            {
+                {
+                    text = "Cancel",
+                    id = "close",
+                    callback = function() UIManager:close(dialog) end,
+                },
+                {
+                    text = "Search",
+                    is_enter_default = true,
+                    callback = function()
+                        local query = trim(dialog:getInputText())
+                        if query == "" then
+                            self:showError("Enter a title or author.")
+                            return
+                        end
+                        UIManager:close(dialog)
+                        self.link_search = {
+                            local_book = local_book,
+                            query = query,
+                            documents = {},
+                            scanned = 0,
+                        }
+                        self:loadLinkSearch(false)
+                        if menu then replaceMenuItems(menu, self:getLinkSearchItems()) end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 function Browser:selectionCount()

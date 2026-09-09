@@ -16,13 +16,13 @@ uses `NetworkMgr:runWhenOnline()` before `synchronize()` runs.
 
 | Area | Main implementation |
 | --- | --- |
-| Settings | `LuaSettings` stores the access token, directory, filters, sync options, last-sync timestamp, document tag/location maps, author/source URL lookup maps, and the cover URL cache index. |
+| Settings | `LuaSettings` stores the access token, directory, filters, sync options, last-sync timestamp, document tag/location maps, author/source URL lookup maps, cover URL cache index, and explicit local-file-to-Reader links. |
 | Authentication/API | `callAPI()` sends `Authorization: Token <token>` to Reader v3, retries Kindle `wantread`, and handles 429 `Retry-After`. `makeJsonRequest()` posts v2 highlight payloads. |
 | Document retrieval | Automatic sync's `getDocumentList()` pages `new`, `later`, and `shortlist` with HTML. `api/reader.lua` separately fetches 25-item metadata-only pages for the browser. `getArchivedDocuments()` pages archive changes. |
 | Files/content | `downloadDocument()` writes `[rw-id_<id>] <safe title>.html`, then best-effort applies a Reader cover. `processHtmlContent()` rewrites responsive markup, fetches inline images, base64-embeds them, and applies an image budget. Missing HTML produces a small fallback page. |
 | Metadata/sidecars | `setDocumentMetadata()` writes `doc_props` and `custom_props` through `DocSettings.openSettingsFile():flushCustomMetadata(filepath)`, then broadcasts metadata invalidation. |
 | Collections | Optional `ReadCollection` maps Reader location to `Readwise: <Location>` and batches writes. |
-| Highlights | KOReader history and Kindle My Clippings are parsed. `buildHighlightContext()` resolves the book-level fields from the stored Reader record; `api/highlights.lua` builds the payloads, batches them 100 per request, and reports what the server confirmed via `modified_highlights`. |
+| Highlights | KOReader history and Kindle My Clippings are parsed. `buildHighlightContext()` resolves the book-level fields from a downloaded Reader record or an explicit exact-local-path link; `api/highlights.lua` builds the payloads, batches them 100 per request, and reports what the server confirmed via `modified_highlights`. |
 | Completion/archive | A `.sdr` `summary.status == "complete"` causes PATCH-to-archive then local deletion. Archive cleanup compares remote IDs updated since `last_sync_time`. |
 | UI | Nested main-menu tables, `InfoMessage`, `InputDialog`, `ConfirmBox`, `MultiConfirmBox`, `SpinWidget`, and the download-directory picker. Downloads show `ui/downloadprogress.lua`: a real progress bar with counts, bytes, and a Cancel button. Other long steps still use a replaced `InfoMessage`. |
 
@@ -34,6 +34,34 @@ delete local files absent from its filtered server list, so a picker must never
 reuse reconciliation. Every downloaded document may flush settings twice for
 author/source metadata. HTML conversion is regex-heavy and memory intensive;
 leave it stable in Phase 1.
+
+### Local-book Reader links
+
+`library/local_links.lua` persists a compact Reader metadata record against the
+exact path of a local KOReader book. **Link current book to Reader…** uses the
+existing metadata-only Reader search and requires the user to choose a result;
+the filename is never an identity match. No HTML is fetched for this operation.
+
+On export, an explicit link supplies the Reader title, author, source URL,
+category, image URL, and Reader URL. The latter provides a stable
+`highlight_url` base. The v2 highlight API has no Reader-document ID field, so
+this is grouping metadata, not a guaranteed attached Reader highlight. Moving
+or renaming the local file invalidates its path-keyed link, and My Clippings
+records without a local file cannot resolve one.
+
+### Manual linked-book progress
+
+The **Linked book progress** submenu is manual and only available for the open
+local book with an explicit Reader link. Sending reads KOReader's existing
+`percent_finished` sidecar, fetches linked Reader metadata with HTML disabled,
+and replaces only a visible, HTML-comment-marked `KOReader progress: N%` line in its
+top-level `notes` field. It preserves the rest of the Reader note and removal
+is confirmed before patching the document.
+
+Applying the Reader percentage fetches `reading_progress` and dispatches the
+existing `GotoPercent` event only after confirmation. It is deliberately not a
+background or bidirectional sync: Reader offers no progress write field, and
+the two readers paginate different renderings.
 
 The chief architectural debt is the concentration of transport, Reader mapping,
 settings, filesystem work, HTML/images, metadata, collections, highlights,
