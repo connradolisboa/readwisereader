@@ -65,7 +65,9 @@ local Progress = require("library/progress")
 local ProgressNote = require("library/progress_note")
 local ReaderAPI = require("api/reader")
 local HighlightsAPI = require("api/highlights")
+local HighlightsReadAPI = require("api/highlights_read")
 local Browser = require("ui/browser")
+local HighlightsBrowser = require("ui/highlights")
 local DownloadProgress = require("ui/downloadprogress")
 local _ = require("gettext")
 local T = FFIUtil.template
@@ -216,6 +218,19 @@ function ReadwiseReader:init()
                 ["Authorization"] = "Token " .. self.access_token,
             })
         end,
+    }
+    self.highlights_read_api = HighlightsReadAPI:new{
+        request = function(endpoint, method, body)
+            return self:callAPI(method, endpoint, body, true, HIGHLIGHTS_API_ENDPOINT)
+        end,
+    }
+    self.highlights_browser = HighlightsBrowser:new{
+        highlights_api = self.highlights_read_api,
+        is_configured = function()
+            return type(self.access_token) == "string" and self.access_token ~= ""
+        end,
+        show_progress = function(text) self:showProgress(text) end,
+        hide_progress = function() self:hideProgress() end,
     }
     self.browser = Browser:new{
         reader_api = self.reader_api,
@@ -1065,6 +1080,34 @@ function ReadwiseReader:addToMainMenu(menu_items)
                 sub_item_table_func = function()
                     return self.browser:getLocationItems()
                 end,
+            },
+            {
+                text = "Views",
+                help_text = "Quick Reads, Long Reads, and In Progress scan your Inbox, Later, Shortlist, "
+                    .. "and Archive metadata so you can pick what to download. Nothing downloads automatically.",
+                sub_item_table_func = function()
+                    return self.browser:getViewsMenuItems()
+                end,
+            },
+            {
+                text = "Highlights",
+                help_text = "Read-only access to your Readwise highlights: search stays local to this "
+                    .. "device, and Daily Review shows today's review as sent by Readwise.",
+                sub_item_table = {
+                    {
+                        text = "Search Highlights",
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self.highlights_browser:showSearchDialog(touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text = "Daily Review",
+                        sub_item_table_func = function()
+                            return self.highlights_browser:getDailyReviewItems()
+                        end,
+                    },
+                },
             },
             {
                 text = "Link current book to Reader…",
@@ -2012,16 +2055,19 @@ function ReadwiseReader:showMaxArticlesDialog()
     UIManager:show(spin)
 end
 
-function ReadwiseReader:callAPI(method, endpoint, body, quiet)
+-- `base_url` defaults to the Reader v3 endpoint; api/highlights_read.lua's
+-- adapter passes HIGHLIGHTS_API_ENDPOINT to reuse this same retry/rate-limit/
+-- error-handling path against the v2 highlights API instead.
+function ReadwiseReader:callAPI(method, endpoint, body, quiet, base_url)
     quiet = quiet or false
     local headers = {
         ["Authorization"] = "Token " .. self.access_token,
         ["Content-Type"] = "application/json",
     }
-    
+
     local sink = {}
     local request = {
-        url = API_ENDPOINT .. endpoint,
+        url = (base_url or API_ENDPOINT) .. endpoint,
         method = method,
         headers = headers,
     }

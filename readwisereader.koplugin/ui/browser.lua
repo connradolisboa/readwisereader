@@ -20,6 +20,16 @@ local LOCATION_LABELS = {
     later = "Later",
     shortlist = "Shortlist",
     archive = "Archive",
+    feed = "Feed",
+}
+
+-- Virtual views over the same metadata search already loads: no download
+-- happens by picking one, they just narrow what's shown so items can be
+-- selected for download, same as a location tab or search results.
+local VIEWS = {
+    { key = "quick_reads", text = "Quick Reads" },
+    { key = "long_reads", text = "Long Reads" },
+    { key = "in_progress", text = "In Progress" },
 }
 
 local function displayProgress(progress)
@@ -69,6 +79,7 @@ function Browser:new(options)
         show_progress = options.show_progress,
         hide_progress = options.hide_progress,
         pages = {},
+        views = {},
         downloaded_lookup = nil,
         selected = {},
         search = nil,
@@ -649,6 +660,100 @@ function Browser:getLocationItems()
             text = location.text,
             sub_item_table_func = function()
                 return self:getDocumentItems(location_value)
+            end,
+        })
+    end
+    return items
+end
+
+function Browser:loadView(view_key, append)
+    if self.is_configured and not self.is_configured() then
+        self:showError("Configure your Readwise access token before browsing Reader.")
+        return nil
+    end
+    local current = self.views[view_key]
+    local cursor = append and current and current.next_cursor or nil
+    if append and not cursor then
+        return current
+    end
+
+    self.show_progress(append and "Loading the next page…" or "Scanning your Reader library…")
+    local page, err, status = self.reader_api:viewMetadata(view_key, cursor)
+    self.hide_progress()
+    if not page then
+        self.views[view_key] = self.views[view_key] or { documents = {}, scanned = 0 }
+        self.views[view_key].load_failed = true
+        self:showError(self:errorText(err, status, "load"))
+        return nil
+    end
+
+    if append and current then
+        for _, document in ipairs(page.documents) do
+            table.insert(current.documents, document)
+        end
+        current.next_cursor = page.next_cursor
+        current.scanned = current.scanned + page.scanned
+        current.load_failed = nil
+    else
+        self.views[view_key] = { documents = page.documents, next_cursor = page.next_cursor, scanned = page.scanned }
+    end
+    return self.views[view_key]
+end
+
+function Browser:getViewItems(view_key)
+    local current = self.views[view_key] or self:loadView(view_key, false)
+    if not current then
+        return {
+            { text = "Retry", callback = function(menu)
+                local page = self:loadView(view_key, false)
+                if menu and page then replaceMenuItems(menu, self:getViewItems(view_key)) end
+            end },
+        }
+    end
+
+    local items = self:documentListItems(current.documents, { show_location = true })
+    if #current.documents == 0 then
+        local status = current.load_failed
+            and "Could not load this view. No results were changed."
+            or current.next_cursor
+            and string.format("No matches in %d scanned document(s) yet.", current.scanned)
+            or string.format("No matches in %d scanned document(s).", current.scanned)
+        table.insert(items, { text = status, enabled = false })
+    end
+    if current.load_failed then
+        table.insert(items, {
+            text = "Retry",
+            keep_menu_open = true,
+            callback = function(menu)
+                self:loadView(view_key, current.scanned > 0)
+                if menu then replaceMenuItems(menu, self:getViewItems(view_key)) end
+            end,
+        })
+    end
+    if current.next_cursor and not current.load_failed then
+        table.insert(items, {
+            text = string.format("Load more (%d scanned)", current.scanned),
+            keep_menu_open = true,
+            callback = function(menu)
+                self:loadView(view_key, true)
+                if menu then replaceMenuItems(menu, self:getViewItems(view_key)) end
+            end,
+        })
+    end
+    return items
+end
+
+function Browser:getViewsMenuItems()
+    self.views = {}
+    self.downloaded_lookup = nil
+    self.selected = {}
+    local items = {}
+    for _, view in ipairs(VIEWS) do
+        local view_key = view.key
+        table.insert(items, {
+            text = view.text,
+            sub_item_table_func = function()
+                return self:getViewItems(view_key)
             end,
         })
     end

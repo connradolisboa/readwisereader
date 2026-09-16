@@ -13,9 +13,22 @@ and Kindle-to-Readwise highlight export remain in place throughout.
   row, hold opens details, and Download Selected runs sequentially.
 - Search scans one 25-document public LIST page at a time and filters title,
   author, site, summary, and tags locally. It is not full-text search; Load more
-  explicitly scans the next page. Feed and child highlight/note documents are
-  excluded from search results. Non-ASCII matching is exact-case because Lua 5.1
-  has no Unicode case-folding in this path.
+  explicitly scans the next page. Feed documents are included; child
+  highlight/note documents are excluded from search results. Non-ASCII
+  matching is exact-case because Lua 5.1 has no Unicode case-folding in this
+  path.
+- **Implemented:** Views (Quick Reads, Long Reads, In Progress) reproduce
+  Readwise Reader's own smart views locally, since the public API documents no
+  such filter. They scan Inbox/Later/Shortlist/Archive metadata the same way
+  search does and threshold `reading_time`/`reading_progress`; Feed is excluded.
+  Picking a view only narrows what is shown -- selection and download work the
+  same as any other browser list.
+- **Implemented, read-only:** a Highlights menu separate from the existing
+  export pipeline, backed by `api/highlights_read.lua`: Search Highlights scans
+  v2 `GET /highlights/` one page at a time and filters text/note locally (no
+  documented full-text query parameter exists there either), fetching a
+  highlight's book title/author lazily only when its details are opened. Daily
+  Review calls the documented `GET /review/` endpoint directly.
 - Full HTML is fetched by the documented LIST `id` parameter only for selected
   documents, then passed to the existing downloader.
 - Fetch `image_url` best-effort and install it with `DocSettings:flushCustomCover`
@@ -93,10 +106,14 @@ See [the detailed Phase 1 plan](PHASE-1.md).
 ## Experimental future features
 
 - Multi-article Daily Digest EPUB.
-- True full-text search via a future documented REST endpoint. The public MCP
-  server's `search` tool covers highlights rather than the Reader library, and
-  its OAuth flow is not something this plugin can drive on device, so it is not
-  a shortcut here.
+- True full-text search via a future documented REST endpoint, for both the
+  Reader library and highlights. The public MCP server's `search` tool covers
+  highlights rather than the Reader library, and its OAuth flow is not
+  something this plugin can drive on device, so it is not a shortcut here;
+  local metadata/text-only scanning (implemented above) remains the fallback.
+- Joining highlight search results to their book's title/author without a
+  per-highlight `GET /books/<id>/` fetch, if v2 ever documents an embed/expand
+  parameter.
 - Reader-to-Kindle highlight import.
 - Generated fallback covers for documents without `image_url`.
 

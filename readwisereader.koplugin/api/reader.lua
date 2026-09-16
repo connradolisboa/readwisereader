@@ -104,7 +104,20 @@ function Reader:listMetadata(location, cursor)
     return { documents = documents, next_cursor = next_cursor, result_count = result_count }
 end
 
+-- Locations scanned by search and by views (below). Feed is included: it is a
+-- documented, listable location and a user may reasonably want to search it,
+-- unlike views, which stay closer to "things you might download" and leave
+-- Feed out. Child highlight/note documents are excluded from both by their
+-- own parent_id check.
 local SEARCH_LOCATIONS = {
+    new = true,
+    later = true,
+    shortlist = true,
+    archive = true,
+    feed = true,
+}
+
+local VIEW_LOCATIONS = {
     new = true,
     later = true,
     shortlist = true,
@@ -139,11 +152,11 @@ function Reader.documentMatches(document, query)
     return false
 end
 
--- The public v3 REST API has no documented search parameter. Search therefore
--- scans one metadata-only list page per call and filters it locally. Callers
--- retain next_cursor and explicitly request more pages, keeping Kindle memory
--- and network use bounded.
-function Reader:searchMetadata(query, cursor)
+-- One metadata-only list page, filtered locally by `predicate`. Shared by
+-- search and views since neither has a documented server-side parameter to
+-- ask for instead. Callers retain next_cursor and explicitly request more
+-- pages, keeping Kindle memory and network use bounded.
+function Reader:scanMetadata(cursor, predicate)
     local page, err, status = self:listMetadata(nil, cursor)
     if not page then
         return nil, err, status
@@ -151,9 +164,7 @@ function Reader:searchMetadata(query, cursor)
 
     local matches = {}
     for _, document in ipairs(page.documents) do
-        if SEARCH_LOCATIONS[document.location]
-                and not document.parent_id
-                and Reader.documentMatches(document, query) then
+        if predicate(document) then
             table.insert(matches, document)
         end
     end
@@ -162,6 +173,58 @@ function Reader:searchMetadata(query, cursor)
         next_cursor = page.next_cursor,
         scanned = page.result_count,
     }
+end
+
+-- The public v3 REST API has no documented search parameter.
+function Reader:searchMetadata(query, cursor)
+    return self:scanMetadata(cursor, function(document)
+        return SEARCH_LOCATIONS[document.location]
+            and not document.parent_id
+            and Reader.documentMatches(document, query)
+    end)
+end
+
+-- Reader's own `reading_time` is normalized to a "<int> min" string once in
+-- normalizeDocument; views need the raw minutes back to threshold against.
+local function readingTimeMinutes(document)
+    local text = document and document.reading_time
+    return type(text) == "string" and tonumber(text:match("%d+")) or nil
+end
+
+-- Approximate thresholds mirroring Readwise Reader's own "Quick reads" /
+-- "Longreads" smart views. The public API documents no such filter, so these
+-- are reproduced locally against fields the LIST endpoint already returns.
+local QUICK_READ_MAX_MINUTES = 5
+local LONG_READ_MIN_MINUTES = 20
+
+local VIEW_PREDICATES = {
+    quick_reads = function(document)
+        local minutes = readingTimeMinutes(document)
+        return minutes ~= nil and minutes <= QUICK_READ_MAX_MINUTES
+    end,
+    long_reads = function(document)
+        local minutes = readingTimeMinutes(document)
+        return minutes ~= nil and minutes >= LONG_READ_MIN_MINUTES
+    end,
+    in_progress = function(document)
+        local progress = document.reading_progress
+        return type(progress) == "number" and progress > 0 and progress < 1
+    end,
+}
+
+-- Virtual views: there is no documented view/filter parameter, so this scans
+-- Library metadata the same way search does and filters it against one of the
+-- predicates above.
+function Reader:viewMetadata(view_key, cursor)
+    local predicate = VIEW_PREDICATES[view_key]
+    if not predicate then
+        return nil, "invalid_view"
+    end
+    return self:scanMetadata(cursor, function(document)
+        return VIEW_LOCATIONS[document.location]
+            and not document.parent_id
+            and predicate(document)
+    end)
 end
 
 -- `id` and `withHtmlContent` are documented LIST parameters. This is the only

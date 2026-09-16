@@ -136,8 +136,11 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Highlights Kindle to Readwise | Supported by current code | v2 highlights export; no Reader-document link is created. |
 | Highlights Readwise to Kindle | Requires experimentation/private API | No reliable source-location mapping into generated HTML. |
 | Daily Digest | Requires experimentation/private API | No documented Reader API endpoint audited. |
-| Feed | Official API, not implemented | `feed` is a documented list location. |
-| Search | Metadata-only implemented | The public LIST REST API has no search parameter. The plugin filters title, author, site, summary, and tags locally, one 25-document page at a time. Readwise's separate CLI/MCP full-text search is not called from Kindle. |
+| Feed | Search implemented; browsing not implemented | `feed` is a documented list location. Library search scans it; the location is not yet one of the Browse Reader tabs. |
+| Search | Metadata-only implemented | The public LIST REST API has no search parameter. The plugin filters title, author, site, summary, and tags locally, one 25-document page at a time, across Inbox/Later/Shortlist/Archive/Feed. Readwise's separate CLI/MCP full-text search is not called from Kindle. |
+| Views (Quick Reads / Long Reads / In Progress) | Implemented locally | Not a documented API filter. Reproduced by scanning Library metadata (Inbox/Later/Shortlist/Archive, Feed excluded) the same way search does, thresholding the existing `reading_time`/`reading_progress` fields (`<=5 min`, `>=20 min`, `0 < progress < 1`). See `api/reader.lua`'s `viewMetadata`. |
+| Highlights listing/search | Read-only, implemented | v2 `GET /highlights/` is paginated but has no documented full-text query parameter, so `api/highlights_read.lua` scans one page at a time and filters text/note locally, mirroring Reader metadata search. A highlight's book title/author is fetched lazily via `GET /books/<id>/` only when its details are opened. |
+| Daily Review | Read-only, implemented | v2 `GET /review/` returns today's review highlights directly, each already carrying its own title/author. |
 
 The public API documents token authentication, paginated list requests,
 optional HTML, `image_url`, metadata, `reading_progress`, update fields, tags,
@@ -345,6 +348,40 @@ counted and does not abort later items. Successful/already-local IDs update the
 session lookup immediately; no per-item directory rescan is performed. Picker
 downloads never run automatic reconciliation, archive actions, highlight export,
 filter mutation, or `last_sync_time` updates.
+
+## Phase 1C: Feed search, virtual views, and read-only highlights
+
+`api/reader.lua` now shares one `scanMetadata(cursor, predicate)` helper
+between Library search and a new `viewMetadata(view_key, cursor)`. Search's
+location set gained `feed`; views (`quick_reads`, `long_reads`, `in_progress`)
+deliberately keep their own narrower location set (Inbox/Later/Shortlist/
+Archive) and exclude Feed, since a view is meant to help pick what to
+download next rather than browse a subscription stream. Both still page
+one 25-document metadata-only request at a time and never preload the full
+library. `ui/browser.lua` exposes views the same way it exposes Search
+results: a `Load more` row, tap-to-select, hold-for-details, and the existing
+selected-download flow -- picking a view never downloads anything by itself.
+
+Highlights got a second, read-only adapter and UI, kept separate from the
+existing export pipeline:
+
+- `api/highlights_read.lua` wraps v2 `GET /highlights/` (paginated, local
+  text/note search since there is no documented full-text query parameter),
+  `GET /books/<id>/` (fetched lazily, one book at a time, only when a
+  highlight's details are opened -- never a bulk join across a page of
+  highlights), and `GET /review/` (the documented Daily Review endpoint,
+  which already nests each highlight's title/author so no book lookup is
+  needed there).
+- `ui/highlights.lua` is a new text-first browser mirroring `ui/browser.lua`'s
+  patterns (InputDialog search, paginated "Search next page", tap for details)
+  but with no selection or download concept, since highlights are read, not
+  downloaded.
+- `main.lua`'s `callAPI` gained an optional fifth `base_url` parameter so the
+  read-only highlights adapter can reuse its existing retry/rate-limit/error
+  handling against `HIGHLIGHTS_API_ENDPOINT` instead of duplicating it.
+
+None of this touches `api/highlights.lua`'s export pipeline, `exportHighlights`,
+or highlight CREATE payloads.
 
 ## Related
 
