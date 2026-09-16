@@ -70,6 +70,56 @@ check("second page also matches", #search_page2.highlights, 1)
 local note_page1 = search_api:searchHighlights("patience")
 check("note text also matches", #note_page1.highlights, 1)
 
+print("\n== books grouped by category ==")
+local book_pages = {
+    [1] = { results = {
+        { id = 1, title = "On Agency", author = "Henrik Karlsson", category = "articles", num_highlights = 3 },
+        { id = 2, title = "Untitled book", num_highlights = 0 },
+    }, next = "https://readwise.io/api/v2/books/?category=articles&page=2" },
+    [2] = { results = { { id = 3, title = "Another Article", num_highlights = 1 } }, next = nil },
+}
+local requested_book_endpoints = {}
+local books_api = HighlightsRead:new{
+    request = function(endpoint, method, body)
+        table.insert(requested_book_endpoints, endpoint)
+        check("books list uses GET", method, "GET")
+        check("books list sends no body", body, nil)
+        local page_number = tonumber(endpoint:match("page=(%d+)")) or 1
+        return book_pages[page_number]
+    end,
+}
+local books_page1 = books_api:listBooksPage("articles")
+check("category is sent as a query param", requested_book_endpoints[1]:find("category=articles", 1, true) ~= nil, true)
+check("first page has two books", #books_page1.books, 2)
+check("book title is kept", books_page1.books[1].title, "On Agency")
+check("missing title falls back to Untitled", books_page1.books[2].title, "Untitled book")
+check("first page reports a next page", books_page1.next_page, 2)
+local books_page2 = books_api:listBooksPage("articles", books_page1.next_page)
+check("second page has one book", #books_page2.books, 1)
+check("last books page has no next page", books_page2.next_page, nil)
+
+print("\n== one book's highlights via the documented book_id filter ==")
+local book_highlight_pages = {
+    [1] = { results = { { id = 10, text = "first in book" }, { id = 11, text = "second in book" } },
+        next = "https://readwise.io/api/v2/highlights/?book_id=1&page=2" },
+    [2] = { results = { { id = 12, text = "third in book" } }, next = nil },
+}
+local requested_book_highlight_endpoints = {}
+local book_highlights_api = HighlightsRead:new{
+    request = function(endpoint)
+        table.insert(requested_book_highlight_endpoints, endpoint)
+        local page_number = tonumber(endpoint:match("page=(%d+)")) or 1
+        return book_highlight_pages[page_number]
+    end,
+}
+local book_highlights_page1 = book_highlights_api:listBookHighlightsPage(1)
+check("book_id is sent as a query param", requested_book_highlight_endpoints[1]:find("book_id=1", 1, true) ~= nil, true)
+check("first page has two highlights", #book_highlights_page1.highlights, 2)
+check("first page reports a next page", book_highlights_page1.next_page, 2)
+local book_highlights_page2 = book_highlights_api:listBookHighlightsPage(1, book_highlights_page1.next_page)
+check("second page has one highlight", #book_highlights_page2.highlights, 1)
+check("last page has no next page", book_highlights_page2.next_page, nil)
+
 print("\n== book lookup ==")
 local book_api = HighlightsRead:new{
     request = function(endpoint, method)

@@ -23,12 +23,22 @@ and Kindle-to-Readwise highlight export remain in place throughout.
   search does and threshold `reading_time`/`reading_progress`; Feed is excluded.
   Picking a view only narrows what is shown -- selection and download work the
   same as any other browser list.
-- **Implemented, read-only:** a Highlights menu separate from the existing
-  export pipeline, backed by `api/highlights_read.lua`: Search Highlights scans
+- **Implemented, read-only, not Kindle-verified:** a Highlights menu separate
+  from the existing export pipeline, backed by `api/highlights_read.lua`,
+  grouped the way Readwise's own highlights view is: Books/Articles/Tweets/
+  Podcasts (the four documented v2 categories), each listing its books
+  (`GET /books/?category=`), each listing its highlights server-side
+  (`GET /highlights/?book_id=`, a documented filter). Search Highlights scans
   v2 `GET /highlights/` one page at a time and filters text/note locally (no
   documented full-text query parameter exists there either), fetching a
-  highlight's book title/author lazily only when its details are opened. Daily
-  Review calls the documented `GET /review/` endpoint directly.
+  highlight's book title/author lazily only when its details are opened.
+  Daily Review calls the documented `GET /review/` endpoint directly. Opening
+  any highlight -- from a book, search, or Daily Review -- shows it in a
+  large scrollable viewer with Previous/Next paging (loading more pages on
+  demand) and a jump into its book's full list, instead of a pop-up. The
+  viewer's button row is built on `TextViewer`, used unverified against an
+  installed KOReader build; see Architecture's Phase 1D for the `pcall`
+  fallback.
 - Full HTML is fetched by the documented LIST `id` parameter only for selected
   documents, then passed to the existing downloader.
 - Fetch `image_url` best-effort and install it with `DocSettings:flushCustomCover`

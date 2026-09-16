@@ -139,8 +139,9 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Feed | Search implemented; browsing not implemented | `feed` is a documented list location. Library search scans it; the location is not yet one of the Browse Reader tabs. |
 | Search | Metadata-only implemented | The public LIST REST API has no search parameter. The plugin filters title, author, site, summary, and tags locally, one 25-document page at a time, across Inbox/Later/Shortlist/Archive/Feed. Readwise's separate CLI/MCP full-text search is not called from Kindle. |
 | Views (Quick Reads / Long Reads / In Progress) | Implemented locally | Not a documented API filter. Reproduced by scanning Library metadata (Inbox/Later/Shortlist/Archive, Feed excluded) the same way search does, thresholding the existing `reading_time`/`reading_progress` fields (`<=5 min`, `>=20 min`, `0 < progress < 1`). See `api/reader.lua`'s `viewMetadata`. |
-| Highlights listing/search | Read-only, implemented | v2 `GET /highlights/` is paginated but has no documented full-text query parameter, so `api/highlights_read.lua` scans one page at a time and filters text/note locally, mirroring Reader metadata search. A highlight's book title/author is fetched lazily via `GET /books/<id>/` only when its details are opened. |
-| Daily Review | Read-only, implemented | v2 `GET /review/` returns today's review highlights directly, each already carrying its own title/author. |
+| Highlights browsing by book | Read-only, implemented | `GET /books/?category=` groups by the four documented v2 categories (books/articles/tweets/podcasts); `GET /highlights/?book_id=` (a documented filter) lists one book's highlights server-side. Tapping a highlight opens it in a near-fullscreen scrollable viewer with Previous/Next, not a menu row's `InfoMessage`. |
+| Highlights search | Read-only, implemented | v2 `GET /highlights/` is paginated but has no documented full-text query parameter, so `api/highlights_read.lua` scans one page at a time and filters text/note locally, mirroring Reader metadata search. A highlight's book title/author is fetched lazily via `GET /books/<id>/` only when its details are opened. |
+| Daily Review | Read-only, implemented | v2 `GET /review/` returns today's review highlights directly, each already carrying its own title/author, shown in the same full-screen viewer as browsing/search. |
 
 The public API documents token authentication, paginated list requests,
 optional HTML, `image_url`, metadata, `reading_progress`, update fields, tags,
@@ -367,21 +368,58 @@ existing export pipeline:
 
 - `api/highlights_read.lua` wraps v2 `GET /highlights/` (paginated, local
   text/note search since there is no documented full-text query parameter),
-  `GET /books/<id>/` (fetched lazily, one book at a time, only when a
-  highlight's details are opened -- never a bulk join across a page of
-  highlights), and `GET /review/` (the documented Daily Review endpoint,
-  which already nests each highlight's title/author so no book lookup is
-  needed there).
-- `ui/highlights.lua` is a new text-first browser mirroring `ui/browser.lua`'s
-  patterns (InputDialog search, paginated "Search next page", tap for details)
-  but with no selection or download concept, since highlights are read, not
-  downloaded.
+  `GET /books/?category=` (paginated, grouped by the four documented v2
+  categories: books/articles/tweets/podcasts), `GET /highlights/?book_id=`
+  (a documented server-side filter, so one book's highlights come straight
+  from the server rather than a local scan), `GET /books/<id>/` (fetched
+  lazily, one book at a time, only when a highlight with no title/author of
+  its own is opened outside its book's own list), and `GET /review/` (the
+  documented Daily Review endpoint, which already nests each highlight's
+  title/author so no book lookup is needed there).
 - `main.lua`'s `callAPI` gained an optional fifth `base_url` parameter so the
   read-only highlights adapter can reuse its existing retry/rate-limit/error
   handling against `HIGHLIGHTS_API_ENDPOINT` instead of duplicating it.
 
 None of this touches `api/highlights.lua`'s export pipeline, `exportHighlights`,
 or highlight CREATE payloads.
+
+## Phase 1D: highlights browsing by book, and a full-screen highlight viewer
+
+The first cut of the Highlights menu was a flat Search/Daily Review list that
+opened a highlight in an `InfoMessage` pop-up -- too small to read a long
+highlight comfortably, and with no way to browse by source. `ui/highlights.lua`
+was redesigned around how Readwise's own highlights view is organized:
+
+- **Category -> book -> highlight drill-down.** `HighlightsBrowser:getMenuItems()`
+  now returns Books/Articles/Tweets/Podcasts (backed by `listBooksPage`), each
+  opening its list of books (backed by `listBookHighlightsPage` per book,
+  server-filtered by `book_id`), each opening its highlights as menu rows.
+  Search Highlights and Daily Review remain, as separate entries below the
+  four categories.
+- **A "reading context" instead of one-off pop-ups.** Opening any highlight
+  builds a `context` table (`{ title, items, has_more(), load_more(),
+  show_view_all }`) scoped to wherever it was opened from -- a book's full
+  list, a search result set, or Daily Review. `items` is the same table the
+  category/book cache above holds, so it grows in place as more pages load
+  rather than being copied. `showHighlightViewer(context, index)` reads
+  `context.items[index]`, calling `load_more()` first if that page has not
+  been fetched yet, so Next never depends on the whole list being loaded
+  upfront.
+- **A near-fullscreen, scrollable viewer instead of `InfoMessage`.**
+  `TextViewer` (`ui/widget/textviewer.lua`) is used at ~95%/90% of screen
+  width/height with a `buttons_table` for Previous/Next (hidden at either end
+  of the loaded list, unless more pages remain) and, outside of a book's own
+  list, "View all highlights in this book" (jumps straight into that book's
+  context at index 1). TextViewer's own scrolling means a long highlight is
+  scrolled, never font-shrunk to fit.
+- **This is unverified against an installed KOReader build.** Per "KOReader
+  integration findings" above, no local KOReader source is available to
+  confirm `TextViewer`'s constructor field names (`buttons_table` in
+  particular). Construction is wrapped in `pcall`, mirroring
+  `ui/downloadprogress.lua`'s precedent: on failure it logs a warning and
+  falls back to the previous `InfoMessage` display, so a field-name mismatch
+  degrades the feature rather than crashing the menu. Confirm the real
+  behavior on device before treating this as verified.
 
 ## Related
 

@@ -99,10 +99,68 @@ function HighlightsRead:searchHighlights(query, page_number)
     return { highlights = matches, next_page = page.next_page, scanned = page.result_count }
 end
 
+-- GET /books/?category=&page=&page_size=100. `category` is one of the four
+-- documented v2 categories (see api/highlights.lua's CATEGORY_MAP): books,
+-- articles, tweets, podcasts. Used to group highlights by source for
+-- browsing, the way Readwise's own highlights view does.
+function HighlightsRead:listBooksPage(category, page_number)
+    local page = type(page_number) == "number" and page_number or 1
+    local endpoint = "/books/?page_size=" .. PAGE_SIZE .. "&page=" .. page
+    if type(category) == "string" and category ~= "" then
+        endpoint = endpoint .. "&category=" .. category
+    end
+    local response, err, status = self.request(endpoint, "GET", nil)
+    if not response then
+        return nil, err or "request_failed", status
+    end
+    local books = {}
+    if type(response.results) == "table" then
+        for _, book in ipairs(response.results) do
+            if type(book) == "table" and book.id ~= nil then
+                table.insert(books, {
+                    id = book.id,
+                    title = stringOrNil(book.title) or "Untitled",
+                    author = stringOrNil(book.author),
+                    category = stringOrNil(book.category),
+                    num_highlights = book.num_highlights,
+                })
+            end
+        end
+    end
+    local next_page = stringOrNil(response.next) and (page + 1) or nil
+    return { books = books, next_page = next_page }
+end
+
+-- GET /highlights/?book_id=&page=&page_size=100. `book_id` is a documented
+-- v2 LIST filter, so a book's highlights come straight from the server
+-- instead of the local page-and-filter scan searchHighlights needs.
+function HighlightsRead:listBookHighlightsPage(book_id, page_number)
+    local page = type(page_number) == "number" and page_number or 1
+    local endpoint = "/highlights/?page_size=" .. PAGE_SIZE .. "&page=" .. page
+        .. "&book_id=" .. tostring(book_id)
+    local response, err, status = self.request(endpoint, "GET", nil)
+    if not response then
+        return nil, err or "request_failed", status
+    end
+    local highlights = {}
+    if type(response.results) == "table" then
+        for _, highlight in ipairs(response.results) do
+            local normalized = HighlightsRead.normalizeHighlight(highlight)
+            if normalized then
+                table.insert(highlights, normalized)
+            end
+        end
+    end
+    local next_page = stringOrNil(response.next) and (page + 1) or nil
+    return { highlights = highlights, next_page = next_page }
+end
+
 -- GET /books/<id>/ -- fetched lazily, one book at a time, only when a
--- highlight's details are opened. There is no bulk join here: preloading
--- every book behind a page of highlights would turn one list request into
--- dozens for a library this plugin does not otherwise need to enumerate.
+-- highlight's details are opened outside of its own book listing (search and
+-- Daily Review results carry no title/author of their own). There is no bulk
+-- join here: preloading every book behind a page of highlights would turn one
+-- list request into dozens for a library this plugin does not otherwise need
+-- to enumerate.
 function HighlightsRead:getBook(book_id)
     if book_id == nil then
         return nil, "missing_book_id"

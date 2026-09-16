@@ -1091,23 +1091,12 @@ function ReadwiseReader:addToMainMenu(menu_items)
             },
             {
                 text = "Highlights",
-                help_text = "Read-only access to your Readwise highlights: search stays local to this "
-                    .. "device, and Daily Review shows today's review as sent by Readwise.",
-                sub_item_table = {
-                    {
-                        text = "Search Highlights",
-                        keep_menu_open = true,
-                        callback = function(touchmenu_instance)
-                            self.highlights_browser:showSearchDialog(touchmenu_instance)
-                        end,
-                    },
-                    {
-                        text = "Daily Review",
-                        sub_item_table_func = function()
-                            return self.highlights_browser:getDailyReviewItems()
-                        end,
-                    },
-                },
+                help_text = "Read-only access to your Readwise highlights, grouped by Books/Articles/"
+                    .. "Tweets/Podcasts. Search stays local to this device; Daily Review shows today's "
+                    .. "review as sent by Readwise.",
+                sub_item_table_func = function()
+                    return self.highlights_browser:getMenuItems()
+                end,
             },
             {
                 text = "Link current book to Reader…",
