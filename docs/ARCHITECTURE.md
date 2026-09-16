@@ -49,6 +49,35 @@ this is grouping metadata, not a guaranteed attached Reader highlight. Moving
 or renaming the local file invalidates its path-keyed link, and My Clippings
 records without a local file cannot resolve one.
 
+### Save link to Reader
+
+**Implemented, not Kindle-verified:** built against upstream KOReader
+`master`'s `readerlink.lua` and `ui/network/manager.lua` (no local KOReader
+checkout in this repo -- see "KOReader integration findings" above); confirm
+`addToExternalLinkDialog`, `onNetworkConnected`, and `NetworkMgr:isOnline()`
+behave as documented on an installed build before relying on it.
+
+`registerExternalLinkAction()` (called once from `init()`, guarded on
+`self.ui.link` so it only runs in the ReaderUI instance, never FileManager)
+adds a button to KOReader's own external-link dialog through
+`ReaderLink:addToExternalLinkDialog`, the same public extension point core
+buttons like Copy and Show QR code use. Tapping a link keeps KOReader's
+existing Copy/QR/Open-in-browser/Cancel options and adds "Save to Readwise
+Later", which posts the tapped href -- not the visible link text -- so it
+works even when the link text itself isn't a URL.
+
+`saveLinkToReadwiseLater()` checks `NetworkMgr:isOnline()`, which only reports
+current status and never prompts to connect. Online, it posts immediately
+through `sendLinkToReader()`. Offline, or on a failed request, it calls
+`queueLinkSave()`, which appends to `pending_link_saves` (deduplicated by URL)
+and persists it through the existing settings object. Queued links are
+retried, without interrupting reading, from two triggers: `onNetworkConnected`
+(KOReader's broadcast event when the network reconnects) and the start of
+`synchronize()` once settings are validated and online is confirmed. Advanced
+sync also exposes a manual "Send queued links to Readwise Later" action,
+enabled only when the queue is non-empty, for an explicit retry with a result
+message either way.
+
 ### Manual linked-book progress
 
 The **Linked book progress** submenu is manual and only available for the open
@@ -99,6 +128,7 @@ References: [DocSettings custom-cover code](https://github.com/koreader/koreader
 | Reading progress retrieval | Supported by current code | List returns `reading_progress` (0-1) plus `first_opened_at`, `last_opened_at`, `saved_at`, and `last_moved_at`. `library/progress.lua` decides when to move the device; `percent_finished` and a `GotoPercent` event apply it. |
 | Reading progress update | Currently blocked | Verified 2026-08-31: UPDATE and `bulk_update` accept only `title`, `author`, `summary`, `language`, `published_date`, `image_url`, `seen`, `location`, `category`, `tags`, `notes`. No percentage, position, offset, or scroll field, and `seen` is boolean. Completion-to-archive stays the only device-to-Reader signal. |
 | Local file upload to Reader | Not available | Verified 2026-08-31: `save` accepts `url` (required) and `html`, with no file-upload field and no multipart endpoint. EPUB/PDF/Markdown upload is web and mobile UI only, so a book already on the device cannot be pushed to Reader. |
+| Save a URL to Reader | Supported by current code | `POST /save/` with `url` and `location = "later"`. Verified 2026-09-16: the endpoint returns `201` (created) or `200` (document already existed); `callAPI` treats both as success. Exposed as "Save to Readwise Later" in the reader's external-link dialog. |
 | Archive | Supported by current code | PATCH location to `archive`. |
 | Move Inbox/Later/Shortlist/Archive | Official API, partly constrained | UPDATE documents `new`, `later`, `archive`, `feed`; shortlist is listable but not documented as writable. |
 | Mark seen/unseen | Official API, not implemented | PATCH `seen`; it is boolean. |

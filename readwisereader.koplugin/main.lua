@@ -177,6 +177,10 @@ function ReadwiseReader:init()
     -- restart between sync and reading does not lose them.
     self.pending_progress_seeds = settings.pending_progress_seeds or {}
 
+    -- Links saved while offline wait here until the network is back
+    -- (onNetworkConnected) or the next sync runs.
+    self.pending_link_saves = settings.pending_link_saves or {}
+
     -- Initialize max articles download limit
     self.max_articles_to_download = settings.max_articles_to_download or 0 -- 0 = unlimited
 
@@ -232,6 +236,27 @@ function ReadwiseReader:init()
     }
     
     self.ui.menu:registerToMainMenu(self)
+    self:registerExternalLinkAction()
+end
+
+-- Adds "Save to Readwise Later" to KOReader's own external-link dialog
+-- (the one that normally offers Copy / Show QR code / Open in browser /
+-- Cancel when a link is tapped), via ReaderLink's public
+-- addToExternalLinkDialog extension point. Only the ReaderUI instance of
+-- this plugin has self.ui.link; the FileManager instance does not.
+function ReadwiseReader:registerExternalLinkAction()
+    if not (self.ui.link and self.ui.link.addToExternalLinkDialog) then
+        return
+    end
+    self.ui.link:addToExternalLinkDialog("35_readwisereader_later", function(reader_link, link_url)
+        return {
+            text = _("Save to Readwise Later"),
+            callback = function()
+                UIManager:close(reader_link.external_link_dialog)
+                self:saveLinkToReadwiseLater(link_url)
+            end,
+        }
+    end)
 end
 
 -- ===============================================================================
@@ -1043,6 +1068,10 @@ function ReadwiseReader:addToMainMenu(menu_items)
             },
             {
                 text = "Link current book to Reader…",
+                -- The result list is rendered into this menu after the input
+                -- dialog closes, just like Search Library. Keep it alive so
+                -- the results are visible rather than updating a closed menu.
+                keep_menu_open = true,
                 help_text = "Choose the exact Reader book for the local book currently open in KOReader. "
                     .. "This does not download HTML and never links by title automatically.",
                 enabled_func = function()
@@ -1174,6 +1203,23 @@ function ReadwiseReader:addToMainMenu(menu_items)
                                         timeout = 3
                                     })
                                 end
+                            end)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local count = self.pending_link_saves and #self.pending_link_saves or 0
+                            return count > 0
+                                and string.format("Send queued links to Readwise Later (%d)", count)
+                                or "Send queued links to Readwise Later"
+                        end,
+                        help_text = "Links saved while offline from the reader's external-link dialog wait here until sent.",
+                        enabled_func = function()
+                            return self.pending_link_saves and #self.pending_link_saves > 0
+                        end,
+                        callback = function()
+                            self:runSyncAction(function()
+                                self:flushPendingLinkSaves(true)
                             end)
                         end,
                     },
@@ -2026,7 +2072,7 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet)
         return nil, "network_error"
     end
     
-    if code == 200 or code == 204 then
+    if code == 200 or code == 201 or code == 204 then
         local content = table.concat(sink)
         if content ~= "" then
             local ok, result = pcall(JSON.decode, content)
@@ -2050,6 +2096,124 @@ function ReadwiseReader:callAPI(method, endpoint, body, quiet)
             })
         end
         return nil, "http_error", code
+    end
+end
+
+-- ===============================================================================
+-- SAVE LINK TO READWISE READER "LATER"
+-- ===============================================================================
+-- Entry point for the "Save to Readwise Later" button added to KOReader's
+-- external-link dialog (see registerExternalLinkAction). Sends immediately
+-- when online; otherwise queues the URL locally. Queued links are retried
+-- quietly the next time the network reconnects (onNetworkConnected) or a
+-- sync runs, and can also be retried manually from Advanced sync.
+
+function ReadwiseReader:queueLinkSave(url)
+    for _, item in ipairs(self.pending_link_saves) do
+        if item.url == url then
+            return false
+        end
+    end
+    table.insert(self.pending_link_saves, { url = url, queued_at = os.time() })
+    self:saveSettings()
+    return true
+end
+
+-- v3 /save/ returns 201 (created) or 200 (document already existed).
+function ReadwiseReader:sendLinkToReader(url)
+    local result = self:callAPI("POST", "/save/", { url = url, location = "later" }, true)
+    return result ~= nil
+end
+
+function ReadwiseReader:saveLinkToReadwiseLater(url)
+    if type(url) ~= "string" or url == "" then
+        return
+    end
+    if type(self.access_token) ~= "string" or self.access_token == "" then
+        UIManager:show(InfoMessage:new{
+            text = "Configure your Readwise access token first (Readwise Reader → Settings).",
+            timeout = 4,
+        })
+        return
+    end
+
+    -- isOnline() only checks current status; it never prompts to connect,
+    -- which matters for a quick reading-flow action like this one.
+    if not NetworkMgr:isOnline() then
+        self:queueLinkSave(url)
+        UIManager:show(InfoMessage:new{
+            text = "No connection - queued to send to Readwise Later.",
+            timeout = 3,
+        })
+        return
+    end
+
+    if self:sendLinkToReader(url) then
+        UIManager:show(InfoMessage:new{ text = "Saved to Readwise Later.", timeout = 2 })
+    else
+        self:queueLinkSave(url)
+        UIManager:show(InfoMessage:new{
+            text = "Couldn't reach Readwise - queued to retry later.",
+            timeout = 3,
+        })
+    end
+end
+
+-- announce=false is used for the automatic triggers (reconnect, sync) so a
+-- quiet retry does not interrupt reading; the manual "Advanced sync" action
+-- passes true so the user gets a result either way.
+function ReadwiseReader:flushPendingLinkSaves(announce)
+    if #self.pending_link_saves == 0 then
+        if announce then
+            UIManager:show(InfoMessage:new{ text = "No queued links to send.", timeout = 3 })
+        end
+        return
+    end
+    if type(self.access_token) ~= "string" or self.access_token == "" then
+        return
+    end
+    if not NetworkMgr:isOnline() then
+        if announce then
+            UIManager:show(InfoMessage:new{ text = "Still offline - queued links will send later.", timeout = 3 })
+        end
+        return
+    end
+
+    local remaining = {}
+    local sent = 0
+    for _, item in ipairs(self.pending_link_saves) do
+        if self:sendLinkToReader(item.url) then
+            sent = sent + 1
+        else
+            table.insert(remaining, item)
+        end
+    end
+    self.pending_link_saves = remaining
+    self:saveSettings()
+
+    if announce then
+        if sent > 0 and #remaining == 0 then
+            UIManager:show(InfoMessage:new{
+                text = string.format("Sent %d queued link(s) to Readwise Later.", sent),
+                timeout = 3,
+            })
+        elseif sent > 0 then
+            UIManager:show(InfoMessage:new{
+                text = string.format("Sent %d queued link(s); %d still queued.", sent, #remaining),
+                timeout = 3,
+            })
+        else
+            UIManager:show(InfoMessage:new{ text = "Could not send queued links yet.", timeout = 3 })
+        end
+    end
+end
+
+-- KOReader broadcasts this to every live widget when the network comes back,
+-- so a link queued while offline is retried without the user having to do
+-- anything.
+function ReadwiseReader:onNetworkConnected()
+    if self.pending_link_saves and #self.pending_link_saves > 0 then
+        self:flushPendingLinkSaves(false)
     end
 end
 
@@ -3255,12 +3419,16 @@ function ReadwiseReader:synchronize()
     end
     
     UIManager:close(info)
-    
+
     -- Reset rate limiting for new sync session
     self.api_call_count = 0
     self.sync_start_time = nil
     self.needs_rate_limiting = false
-    
+
+    -- Being here means we're online and configured, so this is also a good
+    -- moment to retry any links queued while offline.
+    self:flushPendingLinkSaves(false)
+
     local sync_start_time = os.date("!%Y-%m-%dT%H:%M:%SZ")
     
     -- Export highlights if enabled
@@ -3489,6 +3657,7 @@ function ReadwiseReader:saveSettings()
         sync_reading_progress = self.sync_reading_progress,
         progress_state = self.progress_state,
         pending_progress_seeds = self.pending_progress_seeds,
+        pending_link_saves = self.pending_link_saves,
     }
     self.readwise_settings:saveSetting("readwisereader", settings)
     self.readwise_settings:flush()
