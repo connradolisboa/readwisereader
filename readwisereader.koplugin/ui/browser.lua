@@ -32,6 +32,14 @@ local VIEWS = {
     { key = "in_progress", text = "In Progress" },
 }
 
+-- Audio-only categories are never listed: their HTML is show notes, not a
+-- transcript, so there is nothing to read. Videos (YouTube) carry their
+-- transcript as content, so they are hidden only when the user asks.
+local AUDIO_CATEGORIES = {
+    podcast = true,
+    audiobook = true,
+}
+
 local function displayProgress(progress)
     if type(progress) ~= "number" then
         return nil
@@ -76,6 +84,7 @@ function Browser:new(options)
         is_configured = options.is_configured,
         downloaded_ids = options.downloaded_ids,
         download_documents = options.download_documents,
+        show_videos = options.show_videos,
         show_progress = options.show_progress,
         hide_progress = options.hide_progress,
         pages = {},
@@ -484,6 +493,25 @@ function Browser:downloadSelected(menu)
     })
 end
 
+function Browser:isHidden(document)
+    if AUDIO_CATEGORIES[document.category] then
+        return true
+    end
+    return document.category == "video" and self.show_videos ~= nil and not self.show_videos()
+end
+
+-- Filtered at display time, not fetch time, so toggling "Show videos" applies
+-- to lists already in memory without refetching them.
+function Browser:visibleDocuments(documents)
+    local visible = {}
+    for _, document in ipairs(documents) do
+        if not self:isHidden(document) then
+            table.insert(visible, document)
+        end
+    end
+    return visible
+end
+
 function Browser:documentListItems(documents, options)
     options = options or {}
     local items = {
@@ -548,8 +576,9 @@ function Browser:getDocumentItems(location)
         }
     end
 
-    local items = self:documentListItems(page.documents)
-    if #page.documents == 0 then
+    local documents = self:visibleDocuments(page.documents)
+    local items = self:documentListItems(documents)
+    if #documents == 0 then
         table.insert(items, { text = "No documents in this location.", enabled = false })
     end
     if page.next_cursor then
@@ -562,6 +591,15 @@ function Browser:getDocumentItems(location)
             end,
         })
     end
+    table.insert(items, {
+        text = "Refresh list",
+        keep_menu_open = true,
+        callback = function(menu)
+            if self:load(location, false) and menu then
+                replaceMenuItems(menu, self:getDocumentItems(location))
+            end
+        end,
+    })
     return items
 end
 
@@ -570,14 +608,15 @@ function Browser:getSearchItems()
     if not search then
         return {}
     end
-    local items = self:documentListItems(search.documents, { show_location = true })
+    local documents = self:visibleDocuments(search.documents)
+    local items = self:documentListItems(documents, { show_location = true })
     table.insert(items, 1, {
         text = "New search…",
         keep_menu_open = true,
         separator = true,
         callback = function(menu) self:showSearchDialog(menu) end,
     })
-    if #search.documents == 0 then
+    if #documents == 0 then
         local status = search.load_failed
             and "Search failed. No results were changed."
             or search.next_cursor
@@ -649,10 +688,12 @@ function Browser:showSearchDialog(menu)
     dialog:onShowKeyboard()
 end
 
+-- Menu builders can be re-run at any time, not just when the menu is opened:
+-- launcher plugins such as ZenOS rebuild every parent list after a
+-- keep_menu_open callback. So they must not reset fetched pages or the
+-- selection; "Refresh list" and "Clear selection" do that explicitly.
 function Browser:getLocationItems()
-    self.pages = {}
     self.downloaded_lookup = nil
-    self.selected = {}
     local items = {}
     for _, location in ipairs(LOCATIONS) do
         local location_value = location.value
@@ -711,8 +752,9 @@ function Browser:getViewItems(view_key)
         }
     end
 
-    local items = self:documentListItems(current.documents, { show_location = true })
-    if #current.documents == 0 then
+    local documents = self:visibleDocuments(current.documents)
+    local items = self:documentListItems(documents, { show_location = true })
+    if #documents == 0 then
         local status = current.load_failed
             and "Could not load this view. No results were changed."
             or current.next_cursor
@@ -740,13 +782,21 @@ function Browser:getViewItems(view_key)
             end,
         })
     end
+    table.insert(items, {
+        text = "Refresh list",
+        keep_menu_open = true,
+        callback = function(menu)
+            if self:loadView(view_key, false) and menu then
+                replaceMenuItems(menu, self:getViewItems(view_key))
+            end
+        end,
+    })
     return items
 end
 
+-- Same as getLocationItems: safe to re-run, keeps views and selection.
 function Browser:getViewsMenuItems()
-    self.views = {}
     self.downloaded_lookup = nil
-    self.selected = {}
     local items = {}
     for _, view in ipairs(VIEWS) do
         local view_key = view.key

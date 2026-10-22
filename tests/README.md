@@ -8,6 +8,7 @@ never touch a real Readwise account.
 
 Run them from the repository root with the same runtime KOReader ships:
 
+    luajit tests/test_browser.lua
     luajit tests/test_highlights.lua
     luajit tests/test_highlights_read.lua
     luajit tests/test_local_links.lua

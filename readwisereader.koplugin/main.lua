@@ -172,6 +172,8 @@ function ReadwiseReader:init()
     -- nothing is ever pushed back; the completion-to-archive path stays the only
     -- device-to-Reader signal. Off by default because the mapping is approximate.
     self.sync_reading_progress = settings.sync_reading_progress or false
+    -- Library browsing only; podcasts and audiobooks are always hidden there.
+    self.show_videos = settings.show_videos ~= false
     -- What Reader reported the last time each document was examined, so an
     -- unchanged position is not replayed on every sync.
     self.progress_state = settings.progress_state or {}
@@ -243,6 +245,7 @@ function ReadwiseReader:init()
         download_documents = function(documents)
             return self:downloadReaderDocuments(documents)
         end,
+        show_videos = function() return self.show_videos end,
         show_progress = function(text) self:showProgress(text) end,
         hide_progress = function() self:hideProgress() end,
         link_local_book = function(filepath, document)
@@ -1396,6 +1399,19 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self.sync_reading_progress = not self.sync_reading_progress
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = "Show videos when browsing",
+                        help_text = "Videos open as their transcript. Turn this off to hide them "
+                            .. "from Browse Reader, Views, and Search. Podcasts and audiobooks "
+                            .. "are always hidden there: Reader provides no transcript for them.",
+                        checked_func = function()
+                            return self.show_videos
+                        end,
+                        callback = function()
+                            self.show_videos = not self.show_videos
                             self:saveSettings()
                         end,
                     },
@@ -3690,6 +3706,7 @@ function ReadwiseReader:saveSettings()
         max_articles_to_download = self.max_articles_to_download,
         sync_only_koreader_tag = self.sync_only_koreader_tag,
         sync_reading_progress = self.sync_reading_progress,
+        show_videos = self.show_videos,
         progress_state = self.progress_state,
         pending_progress_seeds = self.pending_progress_seeds,
         pending_link_saves = self.pending_link_saves,
